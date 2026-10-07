@@ -30,6 +30,18 @@
             }
         },
         {
+            "name": "debug-ninja-arm64-osx",
+            "displayName": "Debug Ninja arm64 macOS",
+            "inherits": "debug-ninja-low-parallel",
+            "binaryDir": "${sourceDir}/build/macos/arm64",
+            "cacheVariables": {
+                "BUILD_TESTING": "ON",
+                "VCPKG_TARGET_TRIPLET": "arm64-osx",
+                "VCPKG_HOST_TRIPLET": "arm64-osx",
+                "CMAKE_OSX_ARCHITECTURES": "arm64"
+            }
+        },
+        {
             "name": "windows",
             "displayName": "Visual Studio Community 2022 Release - amd64",
             "description": "Using Visual Studio 17 2022 MSVC x64",
@@ -56,6 +68,12 @@
             "jobs": 1
         },
         {
+            "name": "debug-ninja-arm64-osx",
+            "displayName": "Build Debug Ninja arm64 macOS",
+            "configurePreset": "debug-ninja-arm64-osx",
+            "jobs": 2
+        },
+        {
             "name": "windows-debug",
             "displayName": "Visual Studio Community 2022 Release - amd64 - Debug",
             "configurePreset": "windows",
@@ -75,6 +93,14 @@
             "name": "debug-tests",
             "displayName": "Run Debug tests",
             "configurePreset": "debug-ninja-low-parallel",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "debug-arm64-osx-tests",
+            "displayName": "Run Debug arm64 macOS tests",
+            "configurePreset": "debug-ninja-arm64-osx",
             "output": {
                 "outputOnFailure": true
             }

@@ -11,3 +11,5 @@
 /tmp/test-artifacts
 /examples
 /metadata_client_scenario_outputs
+/.idea
+/CMakeUserPresets.json

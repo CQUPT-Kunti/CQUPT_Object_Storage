@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_TAG: 2026.06.24
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 Debug
+            runner: ubuntu-24.04
+            configure_preset: debug-ninja-low-parallel
+            build_preset: debug-ninja-low-parallel
+            test_preset: debug-tests
+          - name: macOS ARM64 Debug
+            runner: macos-15
+            configure_preset: debug-ninja-arm64-osx
+            build_preset: debug-ninja-arm64-osx
+            test_preset: debug-arm64-osx-tests
+          - name: Windows x64 Debug
+            runner: windows-2022
+            configure_preset: windows
+            build_preset: windows-debug
+            test_preset: windows-debug-tests
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.ci/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.ci/vcpkg-bincache
+      CTEST_PARALLEL_LEVEL: 1
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare vcpkg binary cache
+        run: cmake -E make_directory "${{ env.VCPKG_DEFAULT_BINARY_CACHE }}"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-vcpkg-
+
+      - name: Bootstrap vcpkg
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          git clone --filter=blob:none --branch "$VCPKG_TAG" \
+            https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Bootstrap vcpkg
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none --branch "$env:VCPKG_TAG" `
+            https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.configure_preset }} -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.build_preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.test_preset }}
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ runner.os }}-${{ runner.arch }}-test-logs
+          path: build/**/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+          retention-days: 7
