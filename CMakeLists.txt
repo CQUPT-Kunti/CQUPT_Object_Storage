@@ -4,7 +4,7 @@ option(BUILD_TESTING "Build test targets" OFF)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(WIN32)
-    set(CMAKE_TOOLCHAIN_FILE "D:/Tools/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
         CACHE STRING "Vcpkg toolchain file")
   elseif(DEFINED ENV{VCPKG_ROOT} AND EXISTS "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -16,6 +16,18 @@ if(NOT DEFINED VCPKG_TARGET_TRIPLET)
   if(WIN32)
     set(VCPKG_TARGET_TRIPLET "x64-windows"
         CACHE STRING "Vcpkg target triplet")
+  elseif(APPLE AND DEFINED ENV{VCPKG_ROOT})
+    if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+      set(VCPKG_TARGET_TRIPLET "arm64-osx"
+          CACHE STRING "Vcpkg target triplet")
+    elseif(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+      set(VCPKG_TARGET_TRIPLET "x64-osx"
+          CACHE STRING "Vcpkg target triplet")
+    else()
+      message(FATAL_ERROR
+        "Unsupported macOS architecture: ${CMAKE_HOST_SYSTEM_PROCESSOR}. "
+        "Set VCPKG_TARGET_TRIPLET explicitly.")
+    endif()
   elseif(DEFINED ENV{VCPKG_ROOT})
     set(VCPKG_TARGET_TRIPLET "x64-linux"
         CACHE STRING "Vcpkg target triplet")
