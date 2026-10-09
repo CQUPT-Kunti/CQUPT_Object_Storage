@@ -1,190 +1,194 @@
 # Implementation Plan: RDMA Fast Path
 
-**Branch**: `011-rdma-fast-path` | **Date**: 2026-10-08 | **Spec**: [spec.md](spec.md)  
-**Input**: Feature specification from `/specs/011-rdma-fast-path/spec.md`
+**Branch**: `011-rdma-fast-path` | **Spec**: `specs/011-rdma-fast-path/spec.md`
+**Planning mode**: amend the existing feature; do not create a new feature or write implementation code during this planning pass.
 
 ## Summary
 
-在现有 `StorageTransferClient -> StorageNode -> ChunkStore` 链路旁增加一条可选的 Linux RDMA Fast Path。RDMA 可用时优先执行单 chunk 数据搬运；只有在远端数据操作明确尚未开始时才回退现有 gRPC 写入。服务端仍调用现有 `ChunkStore::WriteChunk()` 并等待 durable publish，客户端仍由现有 upload orchestration 汇总 durable facts、调用 `CommitObject`。
-
-按最小可交付顺序完成四个阶段：最小连接/探测、Pull、Push、上传集成与安全 fallback。第一版采用 `librdmacm + libibverbs`、同步调用加单一 completion 处理边界；不做通用 RPC runtime、客户端 slot cache、复杂异步状态机或协议重写。
+Add a small optional `modules/rdma/` library and a store bridge. Stage 1 intentionally implements an asynchronous `RdmaConnection : google::protobuf::RpcChannel`, one CQ completion thread per connection, and a one-service `RdmaServer` to demonstrate the complete generated Protobuf callback chain. Stages 2 and 3 add asynchronous Pull and fixed-slot Push data transfer. Stage 4 selects RDMA as the preferred write path with fallback only before remote data transfer. Stage 5 adds the client `RemoteSlotMap`. Existing gRPC, `ChunkStore::WriteChunk()`, and `CommitObject` remain the durability and visibility authorities.
 
 ## Technical Context
 
-**Language/Version**: C++20  
-**Primary Dependencies**: 现有 gRPC、Protobuf、GoogleTest、CMake、C++ standard library；Linux 可选 `librdmacm` 与 `libibverbs`  
-**Storage**: 继续由 `LocalDiskChunkStore` 完成 staging → flush → publish → directory sync → LIVE index update；RDMA 不新增持久化格式  
-**Testing**: GoogleTest + CTest；每阶段一个 targeted test 命令，最终一次相关测试集合  
-**Target Platform**: Linux 提供真实 RDMA；Windows/macOS 和缺少 RDMA 能力的 Linux 构建提供明确 unsupported 结果并走现有路径  
-**Project Type**: Raft metadata control-plane + StorageNode chunk data-plane  
-**Performance Goals**: 第一版完成单连接、单 chunk（至少 64 MiB）RDMA 搬运；内存上界由一个 pull buffer 或固定数量/容量的 push slots 决定  
-**Constraints**: 不改变既有 proto 语义、持久化格式、CommitObject 可见性、manifest 内容规则和现有 `CreateGrpcStorageTransferClient()` 行为；不允许网络 completion 冒充 durable success  
-**Scale/Scope**: 单客户端、单连接、单 chunk、固定小 slot pool；整对象多 chunk RDMA 并发、长生命周期 slot cache 和性能调优延期
+- **Language/build**: C++20, root `CMakeLists.txt`, CMake presets, Ninja.
+- **Existing RPC/schema**: Protobuf and gRPC generated from root `proto/` schemas.
+- **RDMA backend**: Linux `librdmacm` for connection management plus `libibverbs` for verbs resources/data operations; portable unavailable implementation elsewhere.
+- **Tests**: GoogleTest/CTest, one focused contract test per stage plus existing regressions.
+- **Constraints**: bounded resources, minimal asynchronous V1, no generic event-loop/runtime framework, no persistence-format or public-behavior change.
 
-## Constitution Check
+## Current Baseline Reconciled with Source
 
-*GATE: Phase 0 前检查，Phase 1 设计后复查。*
+- `StorageTransferClient::WriteChunk()` is the existing write abstraction; its gRPC implementation validates identity/size and requests publish durability.
+- Object upload obtains targets from View, writes replicas through a bounded executor, records only durable results, and then calls Metadata `CommitObject`.
+- `StorageNodeService` delegates writes to `ChunkStore::WriteChunk()`.
+- `LocalDiskChunkStore::WriteChunk()` owns checksum/conflict checks, staging, required flush, publish, directory sync, live-index update, and idempotent duplicate behavior.
+- Current `.proto` services generate gRPC interfaces but do not enable classic generic C++ `Service`/Stub generation.
+- The repository uses root-level Protobuf generation and root-level target wiring; module-local `CMakeLists.txt` files are not the current convention.
+- Existing execution is bounded and simple; no shared CQ or generic async framework exists.
 
-- **Preserve The Verified Core — PASS**: 保留现有 gRPC transfer、chunk identity、幂等写、durable publish、manifest-driven read 与 CommitObject；RDMA 是可选旁路。
-- **Protocol/public API/persisted format — PASS**: 不修改现有 `.proto` 与落盘格式。仅新增内部 RDMA wire v1 和 additive C++ factory/config；原 gRPC factory 行为不变。
-- **Durability/recovery — PASS**: 服务端 RDMA 收到 payload 后仍进入同一个 `ChunkStore::WriteChunk()`；StorageNode 重启使 connection generation、MR 和 slot 全部失效，不恢复未发布 RAM 内容。
-- **Cross-platform — PASS**: verbs 代码隔离在 Linux `.cpp`；其他平台返回明确 unsupported，现有 gRPC fallback 保持可用。显式要求 RDMA 而依赖缺失时 configure 失败，不静默伪装成功。
-- **Test entry points — PASS**: 使用一个 RDMA contract target、一个 transfer integration target，以及最终相关 CTest 过滤集合；不新增大规模组合矩阵。
-- **Observability/minimal surface — PASS**: 只增加 transport、generation、attempt state、fallback eligibility 与 durable result 诊断；不复制 metadata 或 Raft 状态。
+## Settled Architecture Decisions
 
-## Current Baseline From Targeted Inspection
+### Control schema and generated Stub
 
-- `modules/store/transfer/object_transfer.cpp` 已提供 bounded chunk upload、replica fan-out、in-flight bytes 控制、actual durable replica manifest 和最终 `CommitObject` gate。
-- `StorageTransferClient::WriteChunk()` 是最窄的单 StorageNode 写入替换点；当前 `GrpcStorageTransferClient` 复用同一 request/chunk identity 做有限重试。
-- `StorageNodeService::WriteChunk()` 已完成 RPC 到 `ChunkStore::WriteChunk()` 的适配，成功只表示 chunk durable，不表示对象已 committed。
-- `LocalDiskChunkStore::WriteChunk()` 已保证同内容幂等、不同内容 conflict，并实现真实 durable publish；RDMA 不应复制这段逻辑。
-- StorageNode discovery 当前只暴露现有 data-plane endpoint。第一版不改 View/proto，而是从现有 host:port 按一个共享、可覆盖的 RDMA port offset 推导 RDMA endpoint；推导失败即明确 unavailable。
-- `google::protobuf::RpcChannel` 仍存在，但官方将这套 proto2 generic service API 标为 deprecated；当前仓库生成的是 gRPC stub。第一版不为学习目标引入第二套通用 RPC runtime。
+Create `proto/rdma_control.proto` with `option cc_generic_services = true`. Generate only its normal C++ Protobuf output (`--cpp_out`), not gRPC output, and expose it through a small `rdma_control_proto` target. Keeping the schema in root `proto/` matches the current repository and generation layout.
 
-## Design Decisions
+The initial service has a tiny `Probe` method. Later messages add descriptors and lifecycle controls for Pull and Push. Payload bytes never enter these messages.
 
-### 1. Build And Capability Boundary
+### Generic module boundary
 
-- 新增 `CQUPT_RDMA_MODE=AUTO|ON|OFF` cache string，默认 `AUTO`。
-- `AUTO`：Linux 找到 `librdmacm`/`libibverbs` 时编译真实实现，否则编译 portable unavailable 实现并输出清晰 configure status。
-- `ON`：非 Linux或缺少依赖时 configure 明确失败；不得回落成 no-op success。
-- `OFF`：只编译 unavailable 实现，运行时由 preferred client 直接走现有 gRPC。
-- 真实实现只放在 `modules/store/rdma/rdma_transport_linux.cpp`；共享 `.h/.cpp` 不包含 verbs 头。
+Create `modules/rdma/`:
 
-### 2. Narrow Transport Surface
+```text
+modules/rdma/
+├── AGENTS.md
+├── module-notes.md
+├── rdma_connection.h/.cpp
+├── rdma_server.h/.cpp
+├── rdma_transport.h/.cpp
+├── rdma_transport_linux.cpp
+├── rdma_memory_region.h/.cpp
+└── rdma_slot_pool.h/.cpp
+```
 
-- 新增一个最小 `RdmaClient`/`RdmaServer` 边界和 factory；Linux 与 unavailable 实现共享相同结果分类。
-- control header 只包含 magic、version、operation、request id length、serialized metadata length、descriptor/slot facts 和 connection generation。
-- chunk metadata 复用现有写请求/响应的字段语义，payload 留空并由 RDMA 数据面搬运；不新增或修改现有 `.proto`。
-- 不实现 pending map、priority queue、batching、shared CQ、selective signaling 或通用 method registry。
-- 不把 `google::protobuf::RpcChannel` 放进生产上传路径。若后续确有教学需求，作为独立实验特性另行规划。
+The root build creates `rdma_core`; there is no module-local CMake file. `rdma_core` depends on Protobuf, `rdma_control_proto`, and conditionally `librdmacm` plus `libibverbs`, but not on store code. Store integration lives in `modules/store/node/storage_rdma_service.h/.cpp`. The existing `storage_node_app` target links `rdma_core` for the server/adapter path, and the existing `storage_client` target links it for the client path; the Raft core does not gain an RDMA dependency.
 
-### 3. Pull Before Push
+`modules/rdma/` owns only generic connection, QP, on-demand MR, SEND/RECV, READ/WRITE, completion, and SlotPool infrastructure. `modules/store/node/storage_rdma_service.*` remains the Storage/RDMA adapter that understands `ChunkStore` and converts completed RDMA input into the existing storage write contract.
 
-- **Pull**：客户端注册当前 bounded chunk buffer，发送只读 descriptor；服务端 RDMA READ 到一个 bounded buffer，校验并调用现有 `ChunkStore::WriteChunk()`，durable response 返回前客户端不得释放 MR。
-- **Push**：服务端启动时创建固定数量、固定容量 slots；客户端每次通过控制消息申请一个 lease，RDMA WRITE 后发送 ready；服务端校验、写盘并释放。
-- 第一版不缓存 remote slots。每次 chunk 重新申请，StorageNode 始终是 ownership 权威；只有控制面往返被证明是瓶颈后才引入 cache。
-- 连接断开、服务重启或 generation 变化立即使 MR descriptor/slot lease 失效。
+Header changes are limited to new interfaces/types and the smallest integration declaration needed by existing transfer code. Complex flow, system calls, CQ processing, durable publish, and helpers remain in `.cpp` files.
 
-### 4. Durable Result And Fallback Matrix
+### Minimal asynchronous execution model
 
-RDMA attempt 只保留四类内部结果：
+- Client: for each Client–StorageNode pair, one `RdmaConnection`, exactly one RC QP, one completion thread, an atomic request-id source, and a mutex-protected `pending_rpcs_` map.
+- `CallMethod()` serializes, creates `PendingRpc`, posts SEND, and immediately returns. SEND buffers remain owned through SEND completion; caller-owned response/controller/done objects remain valid until callback.
+- Each WR uses a lifetime-safe `WrContext { type, request_id, slot_id }` referenced by `wr_id` so the completion handler can distinguish SEND, RECV, READ, and WRITE without bit packing or an operation registry.
+- The completion thread uses `ibv_comp_channel`, `ibv_get_cq_event()`, notification re-registration, CQ draining via `ibv_poll_cq()`, event acknowledgement, and `HandleCompletion()`.
+- Client response completion parses into the registered response, updates the controller, removes the pending entry, and invokes `done` exactly once.
+- Server: each connection uses the same simple completion-thread pattern and one `google::protobuf::Service*`. It retains request/response/controller/closure context after `Service::CallMethod()` returns; the service closure serializes/posts the response only when the asynchronous operation actually completes.
+- No request manager, task scheduler, shared CQ runtime, priority scheduling, timeout wheel, automatic reconnect framework, selective signaling policy, or new general-purpose worker runtime.
+- The same RC QP carries control SEND/RECV, RDMA READ, RDMA WRITE, and READY; V1 does not split these operations across QPs or connections.
 
-| Attempt state | Remote data may exist | Fallback | Upload result |
-|---|---:|---:|---|
-| `not_started` | No | Yes | 走现有 gRPC |
-| `rejected_before_transfer` | No | Yes | 释放资源后走现有 gRPC |
-| `remote_state_uncertain` | Maybe | No | 显式 timeout/IO + uncertain 诊断 |
-| `durable_success` | Yes, durable | No | 返回现有 durable success facts |
+### Connection management and verbs responsibilities
 
-- Pull descriptor 已被服务端接受，或 Push RDMA WRITE 已 post 后失联，均归类为 uncertain。
-- checksum mismatch、invalid request 等收到明确服务端结果时直接返回对应非 retryable 失败，不通过 fallback 掩盖错误。
-- preferred wrapper 复用同一 `request_id` 和 `ChunkIdentity` 调用 gRPC fallback。
-- 最终对象可见性和 manifest 仍完全由现有 upload/CommitObject 流程决定。
+`librdmacm` owns address/route resolution, listen/connect/accept, CM events, and connection teardown. `libibverbs` owns PD, CQ, RC QP, MR, SEND, RECV, RDMA READ, RDMA WRITE, and completion handling.
 
-### 5. Endpoint And Runtime Limits
+Client connection sequence:
 
-- 第一版从 discovery 的 StorageNode endpoint 推导同 host 的 RDMA port，默认 offset 为一个共享常量；client/server 配置允许覆盖 offset，避免把硬件/部署差异写死。
-- 端口溢出、地址解析失败、listener 未启动都视为 `not_started`，可安全 fallback。
-- Pull 同时只保留一个 chunk buffer；Push 使用固定 `slot_count` 与 `slot_capacity`，不动态扩容。
-- completion 采用 blocking/single-handler 模型；只有出现可复现吞吐瓶颈后才考虑更复杂 CQ 架构。
+```text
+rdma_create_event_channel -> rdma_create_id -> rdma_resolve_addr
+-> RDMA_CM_EVENT_ADDR_RESOLVED -> rdma_resolve_route
+-> RDMA_CM_EVENT_ROUTE_RESOLVED -> create PD/CQ/RC QP
+-> pre-post RECV -> rdma_connect -> RDMA_CM_EVENT_ESTABLISHED
+```
+
+Server connection sequence:
+
+```text
+rdma_create_event_channel -> rdma_create_id -> rdma_bind_addr -> rdma_listen
+-> RDMA_CM_EVENT_CONNECT_REQUEST -> create connection context
+-> create PD/CQ/RC QP -> pre-post RECV -> rdma_accept
+-> RDMA_CM_EVENT_ESTABLISHED
+```
+
+The exact cleanup-safe ordering may be refined in code, but these library responsibilities and the single-RC-QP topology are fixed.
+
+### Control and data planes
+
+```text
+generated control Stub
+        │ CallMethod
+        ▼
+RdmaConnection ── post SEND; return ──> RdmaServer ──> one Service*
+        │                                      │
+ completion thread                     async done closure
+        │                                      │
+        └──── on-demand MR / Push slot ────────┘
+                                               │
+                                               ▼
+                                  ChunkStore::WriteChunk()
+                                               │ durable
+                                               ▼
+                                 response CQ -> client done
+```
+
+Pull allocates/registers temporary client and server `RdmaMemoryRegion` objects on demand. The server posts RDMA READ and returns from the business method; READ completion validates/persists the bytes and runs the service closure. The client releases its source MR only after the final response confirms READ completion. Push V1 gives every Client connection its own fixed, bounded SlotPool. The Client mirrors only that pool in `RemoteSlotMap`, chooses a local `FREE` slot, marks it `WRITING`, posts RDMA WRITE, and returns. WRITE completion posts READY/COMMIT as SEND on the same RC QP. The Store validates connection/pool/slot generation, persists through the adapter, ACKs, and returns the slot to `FREE`. There is no global pool, cross-client CAS, or normal per-chunk ownership request. In both modes, transport completion and READY are not durable completion.
+
+### Memory registration model
+
+The MVP has no generic `RdmaMemoryPool`, buffer cache, reusable MR allocator, or dynamic pool growth. Ordinary Pull and control-operation scratch buffers use `RdmaMemoryRegion`: allocate, register, post the asynchronous WR, then deregister/free from the completion/response cleanup path after the last user finishes. Each connection still owns a small fixed set of registered RECV buffers that are re-posted after processing. Push SlotPool MRs remain registered while their published `addr/rkey` descriptors are valid; they are protocol state, not a generic memory pool.
+
+### Integration and fallback
+
+RDMA is inserted behind the storage write abstraction. Existing discovery, replica accounting, manifest handling, cleanup candidates, Metadata commit, reads, Raft, and View behavior do not change. The MVP obtains the RDMA endpoint from the existing host plus a configured offset; a later discovery capability may advertise `grpc_endpoint`, `rdma_endpoint`, and `rdma_supported` without being part of V1.
+
+Fallback to gRPC is permitted only for `not_started` and `rejected_before_transfer`. Temporary exhaustion of the current Client’s pool, no suitable slot capacity, remote-buffer shortage, or RDMA resource shortage is `rejected_before_transfer` only when the Store definitively rejects it before RDMA READ/WRITE begins. `remote_state_uncertain` requires reconciliation using the same identity/request semantics. Invalid metadata/protocol fields, system-limit violations, checksum failure, or identity conflict are `failed`. `durable_success` is terminal success.
 
 ## Delivery Stages
 
-### Stage 1 — Connection And Probe
+### Stage 0 — Build Boundary
 
-- 建立 optional build、portable unavailable 实现和 Linux connection/probe/cleanup。
-- 完成最小 SEND/RECV 请求响应与 generation 校验。
-- 阶段验证：一个 `rdma_transport_contract` targeted command；无 RDMA 设备时验证明确 unavailable，有设备时执行真实 probe。
+- Add the explicit build mode (`OFF`, `AUTO`, `REQUIRED`) and clear `librdmacm`/`libibverbs` platform/dependency behavior.
+- Add `rdma_control_proto`, `rdma_core`, module documentation, and the focused test target.
+- Prove OFF/AUTO configure and compile without needing RDMA hardware.
 
-### Stage 2 — Pull Data Path
+### Stage 1 — Minimal Async RpcChannel + RDMA Connection
 
-- 客户端注册单 chunk buffer；服务端 READ、checksum、调用既有 `ChunkStore::WriteChunk()` 并返回 durable result。
-- 阶段验证：同一 contract target 增加一个 pull case，覆盖 64 MiB、checksum failure 和断开后的 descriptor 失效；只运行一次该 target。
+- Add `Probe`, `RdmaRpcController`, asynchronous `RdmaConnection::CallMethod()`, minimal `PendingRpc`/`WrContext`, per-connection CQ completion threads, `librdmacm` client/server lifecycle, one RC QP, and asynchronous one-service `RdmaServer` dispatch.
+- Test immediate return after posting, unavailable/setup failure, CM connect/accept, the single-QP topology, request-id matching, generated Stub callback traversal, controller status, callback-once behavior, and cleanup.
 
-### Stage 3 — Push Slot Path
+### Stage 2 — Pull
 
-- 服务端固定 slot pool、lease state/generation、WRITE-ready-persist-release 流程。
-- 不实现客户端 slot cache。
-- 阶段验证：同一 contract target 增加一个 push case，覆盖并发争用、旧 generation 拒绝和 durable ACK；只运行一次该 target。
+- Add on-demand `RdmaMemoryRegion` allocation/registration and descriptor exchange; do not add a generic registered-memory pool.
+- Server posts RDMA READ and returns; READ completion validates, delegates to the store bridge, runs the response closure after the durable result, and triggers eventual MR cleanup.
+- Test large chunk, asynchronous completion, checksum rejection, client/server temporary-MR lifetime, durable boundary, and cleanup.
 
-### Stage 4 — Preferred Transfer And Safe Fallback
+### Stage 3 — Push V1
 
-- 在 `StorageTransferClient` 旁增加 additive preferred factory；现有 gRPC factory 不变。
-- RDMA success 转换为现有 durable result；仅 `not_started/rejected_before_transfer` 调用 gRPC fallback；uncertain 不重发。
-- `storage_node_app` 启动/关闭 RDMA server，`storage_client` 使用 preferred factory；现有未启用 RDMA 的命令行为保持不变。
-- 阶段验证：一个 transfer integration target；最终追加一次相关 CTest 集合，不运行全仓 all group。
+- Allocate one fixed, bounded SlotPool per Client connection and expose its descriptors during connection initialization/pool fetch.
+- Enforce `FREE → WRITING → READY → FLUSHING → FREE`, connection/pool/slot generation, and asynchronous same-RC-QP WRITE-completion→READY ordering without per-chunk ownership acquisition.
+- Test cross-client isolation, stale generation rejection, successful publish/ACK, and safe reuse.
 
-## Validation Budget
+### Stage 4 — Preferred RDMA + Safe Fallback
 
-- 编码前仅执行 configure/dependency capability check，不先跑全仓 baseline。
-- 每个 Stage 完成后运行一个与该阶段直接对应的 targeted test command；失败必须修复，不允许 skip。
-- 全部阶段完成后只运行一次：RDMA targets + `storage_upload_integration` + `storage_write_chunk_contract`。
-- 不新增性能矩阵、长时间 stress、全平台实机矩阵或全仓 `all`；真实硬件只做 quickstart 中的一次 64 MiB smoke。
+- Add transport selection behind `StorageTransferClient` and wire application configuration.
+- Prefer configured RDMA mode; fall back only before remote data transfer.
+- Test the complete attempt-state matrix and unchanged gRPC behavior.
 
-## Project Structure
+### Stage 5 — Client Slot Map
 
-### Documentation (this feature)
+- Harden `StorageNodeId -> RemoteSlot[]` as the local mirror of only the current Client’s assigned pool; normal writes reuse it without requesting ownership per chunk.
+- Invalidate on store restart, reconnect, connection generation change, slot/rkey generation change, and explicit invalidation.
+- Test reuse, invalidation, and pool refresh. The Store remains authoritative for pool creation/destruction, MR registration, generation, disconnect/reconnect, and restart invalidation.
+
+## Validation Strategy
+
+Each stage completes only its focused test and the smallest relevant existing regression before the next begins. The final pass runs the normal unit and persistence groups at low parallelism. No benchmark or stress gate is required.
+
+| Stage | Focused evidence |
+|---|---|
+| 0 | OFF/AUTO configure and build; REQUIRED fails clearly without both Linux RDMA libraries |
+| 1 | CM lifecycle, one RC QP, immediate `CallMethod()` return, pending-map/CQ callback round trip, async server completion, and cleanup |
+| 2 | Async Pull checksum, on-demand temporary-MR lifetime/cleanup, durable ACK |
+| 3 | Per-client pool isolation, async same-QP WRITE-completion→READY, generation, durable ACK/reuse |
+| 4 | Fallback state matrix and gRPC regression |
+| 5 | Assigned-pool mirror reuse and every invalidation trigger |
+
+## Constitution Check
+
+- Existing business, protocol, persistence, and public API behavior remain unchanged.
+- Required durability never silently degrades; durable success still comes only from `ChunkStore::WriteChunk()`.
+- Complex behavior and platform code remain in `.cpp` files.
+- New headers exist only for new module interfaces and minimal integration seams.
+- The plan adds no test skips, deleted tests, SPDK/FastBlock dependency, or speculative runtime abstraction.
+
+## Project Structure Changes
 
 ```text
-specs/011-rdma-fast-path/
-├── spec.md
-├── plan.md
-├── research.md
-├── data-model.md
-├── quickstart.md
-├── checklists/
-│   └── requirements.md
-├── contracts/
-│   ├── rdma-control-and-data.md
-│   ├── durability-and-fallback.md
-│   └── transport-selection.md
-└── tasks.md
-```
-
-### Source Code (repository root)
-
-```text
-modules/store/
-├── rdma/
-│   ├── AGENTS.md
-│   ├── module-notes.md
-│   ├── rdma_transport.h
-│   ├── rdma_transport.cpp
-│   └── rdma_transport_linux.cpp
-├── transfer/
-│   ├── storage_transfer_client.h
-│   └── storage_transfer_client.cpp
-├── node/
-├── chunk/
-└── common/
-
-apps/
-├── storage_node_app.cpp
-└── storage_client.cpp
-
-tests/
-├── rdma_transport_contract_test.cpp
-├── storage_transfer_rdma_test.cpp
-├── storage_upload_integration_test.cpp
-└── CMakeLists.txt
-
+proto/rdma_control.proto
+modules/rdma/{AGENTS.md,module-notes.md,rdma_*.h,rdma_*.cpp}
+modules/store/node/storage_rdma_service.h
+modules/store/node/storage_rdma_service.cpp
+tests/rdma_transport_contract_test.cpp
 CMakeLists.txt
+tests/CMakeLists.txt
 ```
 
-**Structure Decision**: 新 `modules/store/rdma` 是必要的平台/transport 隔离边界，但保持一个 public header 和两个 implementation files。durability 逻辑不进入该模块；它只把完整 chunk 交给现有 `ChunkStore`。`proto/`、`modules/raft/`、manifest 格式和既有 gRPC service 不修改。
-
-## Post-Design Constitution Check
-
-- Verified core: **PASS** — 所有成功写仍走现有 ChunkStore 与 CommitObject。
-- Protocol/persistence: **PASS** — 新 wire 仅属于内部 RDMA transport v1，不修改现有 proto 或 persisted bytes。
-- Durability/restart: **PASS** — durable ACK 来自现有 publish 结果；restart 丢弃 RAM slots 并递增 generation。
-- Cross-platform: **PASS** — portable unavailable implementation 明确返回状态并保留 gRPC。
-- Minimal surface: **PASS** — 一个新模块、两个新测试文件、两个现有 adapter/app 接点；slot cache、generic RPC runtime 与多 chunk RDMA concurrency 延期。
-
-## Complexity Tracking
-
-| Violation | Why Needed | Simpler Alternative Rejected Because |
-|---|---|---|
-| 新增 `modules/store/rdma` 平台模块 | verbs headers、CM/QP/MR/CQ 生命周期必须隔离，且需要 non-Linux unavailable 实现 | 把 verbs 直接写入 transfer/node 会污染共享业务路径并扩大平台条件编译范围 |
-| additive preferred transfer factory | 必须在不改变既有 gRPC factory 行为的情况下表达 RDMA-first/fallback | 直接改 `CreateGrpcStorageTransferClient()` 会让名称和旧调用契约失真 |
+Existing storage transfer and app files change only when Stage 4 selects the new path. No View, Metadata, Raft, read-path, or persisted-format file is changed.

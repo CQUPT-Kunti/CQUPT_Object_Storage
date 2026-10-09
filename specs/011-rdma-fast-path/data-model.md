@@ -1,105 +1,175 @@
 # Data Model: RDMA Fast Path
 
-## 1. RDMA Connection
+All types below are transport/runtime state unless stated otherwise. They do not alter the persisted chunk, manifest, Metadata, Raft, or View formats.
 
-**Purpose**: 表达一个客户端到 StorageNode 的可关闭连接及其资源 generation。
+## `RdmaRpcHeader`
 
-**Fields**:
+Bounded framing metadata for a control request or response.
 
-- endpoint：由现有 StorageNode endpoint 和 RDMA port offset 推导。
-- generation：本次 listener/connection 代次；重启或重建后变化。
-- capability：available / unavailable，并携带明确原因。
-- state：disconnected → connecting → connected → closing → closed。
-- outstanding operation：第一版最多一个同步操作。
+| Field | Meaning |
+|---|---|
+| `magic`, `version` | Reject incompatible frames |
+| `request_id` | Correlate an asynchronous request and response; retained for diagnostics/idempotency |
+| `method_index` or bounded method id | Select a method on the one registered service |
+| `payload_length` | Bound parsing and receive buffer use |
+| `status_code` | Transport/controller result in a response |
 
-**Rules**:
+Validation: known version, known message kind, configured maximum payload, matching request id, and known method. Chunk bytes are never part of this frame.
 
-- closed connection 的 QP、CQ、MR 必须按反向构造顺序释放。
-- generation 不匹配的 descriptor/lease 一律拒绝。
-- connection failure 只有发生在数据操作前才可标记 safe fallback。
+## `RdmaRpcController`
 
-## 2. Remote Buffer Descriptor
+A small concrete `google::protobuf::RpcController` used by the generated Stub and server dispatch.
 
-**Purpose**: Pull 模式中让 StorageNode 读取客户端 bounded chunk buffer。
+State: `failed`, `error_text`, `canceled`. The completion thread updates failure state before invoking the caller’s closure. Cancellation callbacks and deadlines do not create a general asynchronous runtime in V1.
 
-**Fields**:
+## `RdmaConnection`
 
-- address、rkey、length。
-- connection generation。
-- request id、chunk identity 的绑定摘要。
-- access：只允许 remote read。
+Owns one Client–StorageNode transport connection, exactly one RC QP, and a minimal asynchronous RPC correlation table. The same QP carries SEND, RECV, RDMA READ, RDMA WRITE, and READY/COMMIT SEND.
 
-**Validation**:
+Lifecycle: `DISCONNECTED → CONNECTING → READY → CLOSING → CLOSED`.
 
-- length 必须等于 expected size，且不超过单 chunk 上限。
-- descriptor 只在所属连接和 operation 生命周期内有效。
-- client 收到服务端 read-complete/durable result 前不得 deregister/reuse。
+Minimal asynchronous members:
 
-## 3. Slot Lease
-
-**Purpose**: Push 模式中表达 StorageNode 权威授予的一次写入权。
-
-**Fields**:
-
-- slot id、address、rkey、capacity。
-- owner connection、request id、chunk identity。
-- generation。
-- state：FREE / RESERVED / WRITING / READY / FLUSHING / FREE。
-
-**Transitions**:
-
-```text
-FREE --reserve--> RESERVED --client post--> WRITING
-WRITING --ready--> READY --validate--> FLUSHING
-FLUSHING --durable success/failure cleanup--> FREE
-RESERVED/WRITING --disconnect or generation change--> invalidated -> FREE
+```cpp
+std::thread completion_thread_;
+std::atomic<bool> running_{false};
+std::atomic<uint64_t> next_request_id_{1};
+std::mutex pending_mutex_;
+std::unordered_map<uint64_t, PendingRpc> pending_rpcs_;
 ```
 
-**Rules**:
+`CallMethod()` records a `PendingRpc`, posts SEND, and returns. The completion thread waits through `ibv_comp_channel`, drains the CQ, handles CQEs, and invokes callbacks. Request/response buffers and associated WR contexts remain owned until their specific completion or deterministic connection teardown.
 
-- 同一时刻一个 slot 只有一个 owner。
-- 第一版 lease 不缓存；完成或失败后必须重新申请。
-- `READY` 之前不能调用 `ChunkStore::WriteChunk()`；`FLUSHING` 完成之前不能复用 slot。
+Linux connection-management fields are backed by `librdmacm` (`rdma_event_channel`, `rdma_cm_id`, CM events/lifecycle). PD, CQ, RC QP, MR, work requests, and completions are backed by `libibverbs`.
 
-## 4. Chunk Transfer Attempt
+## `PendingRpc`
 
-**Purpose**: 关联一次 RDMA 尝试与可能的 gRPC fallback。
+Minimal client correlation record:
 
-**Fields**:
+```cpp
+struct PendingRpc {
+    uint64_t request_id;
+    google::protobuf::RpcController* controller;
+    google::protobuf::Message* response;
+    google::protobuf::Closure* done;
+};
+```
 
-- request id、chunk identity、target node。
-- mode：pull / push。
-- attempt state：not_started / rejected_before_transfer / remote_state_uncertain / durable_success。
-- transport diagnostic：capability、endpoint、operation stage、system error。
-- storage result：status、durable、already_exists、checksum、metadata。
+It may additionally own the serialized request/SEND buffer and its cleanup handle so those bytes outlive SEND completion. The caller guarantees that `controller`, `response`, and `done` remain valid until asynchronous completion. On response RECV completion, the handler parses the response, records failure if needed, removes the map entry, and runs `done` exactly once.
 
-**Rules**:
+## `WrContext`
 
-- fallback 必须沿用相同 request id 与 chunk identity。
-- uncertain 不得转换为 retryable fallback。
-- durable success 必须来自现有 `ChunkStore` 响应，不来自 CQ completion。
+```cpp
+enum class WrType { Send, Recv, Read, Write };
 
-## 5. Preferred Transfer Decision
+struct WrContext {
+    WrType type;
+    uint64_t request_id;
+    uint64_t slot_id;
+};
+```
 
-**Purpose**: 在 RDMA 与现有 gRPC client 之间做唯一、可测试的选择。
+`wr_id` references a lifetime-safe context. SEND completion releases only SEND-owned bytes/context; RECV locates a pending/client or server request; READ/WRITE triggers the operation-specific callback. The context remains valid until its CQE is handled. V1 does not use bit packing or a shared operation registry.
 
-**Inputs**:
+## `ServerRpcContext`
 
-- runtime preference、compiled capability、derived endpoint。
-- RDMA attempt state。
-- 原始 `StorageTransferWriteRequest`。
+Minimal server-owned state holding the parsed request, response, controller, completion closure, request id, and any temporary RDMA resources. `Service::CallMethod()` may return before this context completes. The service closure serializes/posts the response only after asynchronous READ/WRITE/store work finishes; response SEND resources remain valid through SEND completion.
 
-**Outputs**:
+## `ConnectionGeneration`
 
-- selected transport。
-- whether fallback attempted。
-- 最终现有 `StorageTransferWriteResult`。
-- RDMA/fallback diagnostics。
+A monotonically changing runtime token assigned when a connection becomes ready. Cached remote descriptors are valid only for their originating connection generation.
 
-**Invariant**: 只有 `not_started` 和 `rejected_before_transfer` 能进入 fallback；其它状态直接返回。
+It is not persisted and is not a Raft term or storage generation.
 
-## Persisted Data Impact
+## `RdmaMemoryRegion`
 
-- 无新 persisted entity。
-- slot、MR、connection、attempt 均为进程内短生命周期状态。
-- chunk 文件、ChunkIndex、metadata manifest、Raft log/snapshot 格式不变。
+| Field | Meaning |
+|---|---|
+| `buffer_` | Buffer obtained on demand, for example with `malloc()` |
+| `size_` | Registered byte length |
+| `mr_` | `ibv_mr*` returned by `ibv_reg_mr()` |
+| `state` | `ALLOCATED`, `REGISTERED`, `IN_FLIGHT`, `COMPLETED`, `DEREGISTERED`, or `FREED` |
+
+Lifecycle:
+
+```text
+malloc -> ibv_reg_mr -> post WR -> asynchronous completion
+       -> ibv_dereg_mr -> free
+```
+
+Cleanup is callback-driven and never requires the business thread to block. For Pull, the client region remains registered until the final response confirms the server completed RDMA READ. The server destination region remains registered through READ completion and remains allocated until checksum/store consumers finish.
+
+There is no generic MemoryPool, buffer cache, registered-MR reuse, pool allocator, or dynamic pool growth in the MVP.
+
+## Connection RECV Buffers
+
+Each connection owns a small fixed set of registered RECV buffers. A RECV completion processes the message and re-posts the buffer; the MR is released only after the connection stops and no associated RECV WR remains outstanding. These buffers satisfy SEND/RECV protocol requirements and are not a generic memory pool.
+
+## `RdmaDescriptor`
+
+Control-plane description of a data region: address, rkey, length, connection generation, and chunk/request identity. Possession of a descriptor does not imply durable completion or long-lived validity.
+
+## `RemoteSlot`
+
+Server-owned Push buffer descriptor within one Client connection’s assigned SlotPool.
+
+| Field | Meaning |
+|---|---|
+| `slot_id` | Stable index within the current pool generation |
+| `addr`, `rkey` | Current remote-write descriptor |
+| `capacity` | Maximum accepted chunk bytes |
+| `generation` | Rejects stale descriptors after pool refresh/reconnect/restart |
+| `state` | `FREE`, `WRITING`, `READY`, or `FLUSHING` |
+
+Valid transition:
+
+```text
+FREE -> WRITING -> READY -> FLUSHING -> FREE
+```
+
+Before posting RDMA WRITE, the Client may return its local `WRITING` selection to `FREE`. After transfer starts, the slot returns to `FREE` only after completion/state reconciliation makes reuse safe. RDMA WRITE and READY use the same RC QP.
+
+## `ClientSlotPool`
+
+Created and registered by the Store for one established Client connection, then returned as a descriptor set during initialization/pool fetch. It is not shared with other Clients.
+
+Fields: storage node id, client/connection identity, pool generation, connection generation, MR ownership, bounded slot descriptors, and lifecycle state.
+
+The Store creates/destroys the pool, registers its MR, changes generations, and invalidates it on disconnect, reconnect, and Store restart. Normal writes do not acquire per-chunk ownership. READY validation requires the correct connection, pool generation, slot generation, acceptable data length, and valid slot state.
+
+## `RemoteSlotMap` (Push base in Stage 3; lifecycle hardening in Stage 5)
+
+Client-side mirror of its Store-assigned pools:
+
+```text
+StorageNodeId -> RemoteSlot[]
+```
+
+Each entry contains `slot_id`, `remote_addr`, `rkey`, `capacity`, `generation`, and `state`, plus its pool and connection generations. For a given `StorageNodeId`, entries belong only to the current Client. The Client selects a local `FREE` entry and marks it `WRITING`; no per-chunk ownership request is required. The mirror never overrides Store authority.
+
+Invalidate an entry on:
+
+- storage-node restart or server generation change;
+- reconnect or connection generation change;
+- returned slot/rkey generation change;
+- explicit invalidation/rejection from the server.
+
+Map miss or invalidation causes the Client to refresh its assigned pool from the Store. It does not acquire an individual slot for each chunk. The Store’s per-client SlotPool is always authoritative.
+
+## `RdmaAttemptState`
+
+| State | Terminal meaning | Next action |
+|---|---|---|
+| `not_started` | No remote data operation was posted | gRPC fallback allowed |
+| `rejected_before_transfer` | Explicit pre-transfer rejection, including temporary per-client pool exhaustion, no suitable assigned slot capacity, remote-buffer shortage, or RDMA resource shortage | gRPC fallback allowed |
+| `remote_state_uncertain` | Remote execution may have occurred | Reconcile using identity/idempotency; no fallback |
+| `failed` | Definitive invalid metadata/protocol, system-size limit, checksum, identity conflict, or other non-retryable result | Return failure; no fallback |
+| `durable_success` | `ChunkStore::WriteChunk()` returned durable success | Record replica success |
+
+## `RdmaChunkWriteResult`
+
+Control result mapped from the existing store contract: status, durable flag, already-exists flag, observed checksum, and attempt state. It must not fabricate durable success from a verbs completion.
+
+## Persistent Data Impact
+
+None. Chunk identity, on-disk chunk bytes, live index behavior, manifests, cleanup candidates, and Metadata/Raft state retain their existing formats and authorities.

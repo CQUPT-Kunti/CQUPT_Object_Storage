@@ -1,35 +1,71 @@
 # Contract: Transport Selection
 
-## Client Construction
+## Scope
 
-- `CreateGrpcStorageTransferClient()` 保持现有纯 gRPC 行为。
-- 新 preferred factory 组合一个 RDMA client 和现有 gRPC fallback；不修改调用方的 `WriteChunk` 输入和 durable result 语义。
-- RDMA preference 默认开启，但只有 capability available 时才发起连接。
+Transport selection applies only to storage-node chunk writes. Reads and all View, Metadata, Raft, manifest, and `CommitObject` calls retain their existing paths.
+
+## Configuration Modes
+
+| Mode | Startup/build behavior | Write behavior |
+|---|---|---|
+| `OFF` | Do not require `librdmacm`/`libibverbs`; expose explicit unavailable RDMA backend | Use gRPC |
+| `AUTO` | Enable RDMA when supported/configured | Prefer RDMA, otherwise choose gRPC before an RDMA attempt |
+| `REQUIRED` | Configuration/startup fails clearly if real RDMA or either required Linux library is unavailable | Prefer configured RDMA mode; never silently replace missing support |
+
+Pull is the initial/default RDMA data mode. Push becomes selectable after Stage 3.
+
+## Per-Write Selection
+
+```text
+StorageTransferClient::WriteChunk
+              │
+              ▼
+      RDMA enabled for target?
+        │ no              │ yes
+        ▼                 ▼
+      gRPC        begin tracked RDMA attempt
+                           │
+                           ▼
+                 terminal attempt state
+                           │
+          ┌────────────────┼──────────────────────┐
+          ▼                ▼                      ▼
+ not_started /      remote_state_uncertain   failed / durable_success
+ rejected_before_          │                      │
+ transfer                  ▼                      ▼
+          │             reconcile            return result
+          ▼
+        gRPC
+```
+
+Selection is not based only on an exception or status string. It uses the explicit attempt state defined by the durability contract.
+
+`CallMethod()` returning means only that asynchronous submission succeeded; it does not establish transfer or durable success. The attempt-state boundary follows actual WR posting and CQ/response evidence. Once a remote data WR may have executed, callback failure cannot be converted into automatic gRPC fallback.
+
+## Capacity and Resource Classification
+
+The following map to `rejected_before_transfer` only when explicitly detected before posting RDMA READ/WRITE: the current Client’s SlotPool has no `FREE` slot, available assigned slots have insufficient capacity for an otherwise-valid chunk, an on-demand `RdmaMemoryRegion` cannot be allocated/registered, remote buffers are temporarily exhausted, or other RDMA resources are temporarily unavailable. gRPC fallback is safe because no remote data operation began.
+
+A chunk above the system-wide maximum, invalid chunk metadata, identity conflict, invalid checksum fields, or invalid protocol fields maps to `failed`. These errors are not transport availability problems and MUST NOT be hidden by fallback.
 
 ## Endpoint Resolution
 
-- 输入继续使用现有 StorageNode `host:port` endpoint。
-- RDMA endpoint 使用同 host 加共享、可覆盖的 port offset 推导。
-- 非法 host/port、加 offset 溢出或平台不支持时返回 not_started。
-- 第一版不修改 ViewNode/proto 来传播独立 RDMA endpoint。
+V1 derives the RDMA endpoint from the host already returned by View plus a configured port offset. This is an MVP deployment rule only:
 
-## Selection Algorithm
+- it does not modify the current View record;
+- it does not infer RDMA durability support from endpoint presence;
+- connection/probe failure before transfer maps to a safe pre-transfer state;
+- the offset and collision policy are configuration/tuning decisions.
 
-```text
-if RDMA preference is off or capability unavailable:
-    call existing gRPC client
-else:
-    attempt configured RDMA mode
-    if durable_success or explicit non-retryable failure:
-        return its mapped result
-    if not_started or rejected_before_transfer:
-        call existing gRPC client with unchanged identity
-    if remote_state_uncertain:
-        return explicit uncertain failure; do not fallback
-```
+A future discovery revision may advertise `grpc_endpoint`, `rdma_endpoint`, and `rdma_supported`. That change is outside this feature’s V1 contract.
 
-## Compatibility
+## Push Descriptor Cache (Stage 5)
 
-- ReadChunk 继续使用现有 gRPC path；第一版只优化 upload/write。
-- 没有 RDMA 硬件、依赖或 listener 时，外部上传行为与当前 gRPC 基线一致。
-- non-Linux implementation 只能返回 unavailable，不得返回伪 completion 或 durable success。
+For each `StorageNodeId`, the Client mirrors only the SlotPool that the Store assigned to that Client connection. Normal writes select a local `FREE` slot and do not request ownership for every chunk. Eligibility requires matching connection, pool, and slot generations. Restart, reconnect, generation/rkey change, or explicit invalidation discards entries and forces a pool refresh. The mirror never overrides Store authority or exposes another Client’s slots.
+
+## Existing Orchestration
+
+- The object-transfer layer continues to control bounded fanout and byte budgeting.
+- Only `durable_success` contributes to successful replica accounting.
+- Failed/uncertain writes follow existing cleanup/reconciliation policy.
+- Metadata `CommitObject` remains unchanged and occurs only after the required durable replica results.

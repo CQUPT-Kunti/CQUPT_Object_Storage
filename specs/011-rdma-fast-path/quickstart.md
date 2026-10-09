@@ -1,63 +1,83 @@
-# Quickstart: RDMA Fast Path
+# Quickstart: Stage-by-Stage RDMA Validation
 
-本文件定义实现完成后的最小验证路径。命令按阶段执行，不要求每次运行全仓测试。
+This guide is for implementation and review. Complete one stage before starting the next. Commands assume the repository root and the existing low-parallel preset, whose binary directory is `build/linux`.
 
-## 1. Configure
+## Stage 0 — Build Boundary
 
-自动探测 RDMA：
-
-```bash
-cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA_MODE=AUTO
-```
-
-具备 rdma-core 开发依赖、并要求缺失时立即失败：
+Configure without requiring RDMA hardware:
 
 ```bash
-cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA_MODE=ON
-```
-
-明确关闭真实 RDMA、只验证 fallback：
-
-```bash
-cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA_MODE=OFF
-```
-
-## 2. Stage-Level Validation
-
-Stage 1-3 每完成一次，只运行 RDMA contract target：
-
-```bash
-cmake --build --preset debug-ninja-low-parallel --target test_rdma_transport_contract
-ctest --test-dir build/debug-ninja-low-parallel -R '^rdma_transport_contract' --output-on-failure
-```
-
-Stage 4 完成后，只运行 transfer integration target：
-
-```bash
-cmake --build --preset debug-ninja-low-parallel --target test_storage_transfer_rdma
-ctest --test-dir build/debug-ninja-low-parallel -R '^storage_transfer_rdma' --output-on-failure
-```
-
-## 3. Hardware Smoke
-
-在 Linux RDMA 环境执行一次 64 MiB 单 chunk smoke：
-
-1. 确认 configure 输出为真实 RDMA enabled，而不是 unavailable implementation。
-2. 启动一个 StorageNode，确认 RDMA listener generation 已输出。
-3. 上传一个 64 MiB 单 chunk 对象。
-4. 确认诊断显示 RDMA durable success，且没有 fallback。
-5. 读取对象并校验 checksum。
-6. 重启 StorageNode，确认旧 generation descriptor/lease 被拒绝，再用新连接上传成功。
-
-## 4. Final Related Regression
-
-所有阶段完成后只执行一次相关集合：
-
-```bash
+cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA=OFF
 cmake --build --preset debug-ninja-low-parallel
-ctest --test-dir build/debug-ninja-low-parallel \
-  -R '(rdma|storage_upload_integration|storage_write_chunk_contract)' \
-  --output-on-failure
 ```
 
-通过时只记录命令、PASS 与耗时；失败时保存完整日志，仅汇报失败测试、关键断言、分类、最后 50 行和日志路径。
+Then verify automatic detection:
+
+```bash
+cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA=AUTO
+cmake --build --preset debug-ninja-low-parallel
+```
+
+Expected: `OFF` and unsupported `AUTO` build the explicit unavailable backend. `REQUIRED` must fail configuration clearly when `librdmacm`, `libibverbs`, or platform support is absent.
+
+## Stage 1 — Minimal Async RpcChannel
+
+Build and run the focused contract test:
+
+```bash
+cmake --build --preset debug-ninja-low-parallel --target rdma_transport_contract_test
+ctest --test-dir build/linux -R '^rdma_transport_contract$' --output-on-failure
+```
+
+Evidence required: unavailable error, `librdmacm` client/server lifecycle, exactly one RC QP, `CallMethod()` returning before response completion, atomic request ids, pending-map correlation, per-connection CQ thread, SEND/RECV `WrContext`, asynchronous server closure, response parsing, callback-once behavior, fixed RECV re-posting, and deterministic cleanup.
+
+## Stage 2 — Pull
+
+Run the same focused target after adding Pull cases:
+
+```bash
+cmake --build --preset debug-ninja-low-parallel --target rdma_transport_contract_test
+ctest --test-dir build/linux -R '^rdma_transport_contract$' --output-on-failure
+```
+
+Evidence required: large bytes move through asynchronous RDMA READ rather than Protobuf; client and server temporary `RdmaMemoryRegion` objects are registered on demand and callback-released after their final use; bad checksum is rejected; success follows the durable store boundary; no generic MemoryPool exists.
+
+## Stage 3 — Push V1
+
+```bash
+ctest --test-dir build/linux -R '^rdma_transport_contract$' --output-on-failure
+```
+
+Evidence required: one isolated SlotPool per Client connection, no per-chunk ownership RPC, `FREE → WRITING → READY → FLUSHING → FREE`, business-thread return after WRITE posting, WRITE-completion callback posting same-RC-QP READY, stale generation rejection, durable ACK, and safe reuse.
+
+## Stage 4 — Preferred RDMA and Fallback
+
+```bash
+ctest --test-dir build/linux -R '^(rdma_transport_contract|storage_transfer_client)$' --output-on-failure
+```
+
+Evidence required: gRPC fallback occurs only for `not_started` and `rejected_before_transfer`; uncertain, definitive-failure, and durable-success states never fall back.
+
+## Stage 5 — RemoteSlotMap
+
+```bash
+ctest --test-dir build/linux -R '^(rdma_transport_contract|storage_transfer_client)$' --output-on-failure
+```
+
+Evidence required: the map contains only the current Client’s assigned pool, reuses local slots within one generation, and invalidates on restart, reconnect, connection/pool-generation change, rkey/slot-generation change, and explicit invalidation.
+
+## Optional Hardware Smoke Test
+
+After the contract tests pass, run a single-node write on supported RDMA hardware with `CQUPT_RDMA=REQUIRED`. Confirm that `CallMethod()` returns before the response, the ordinary CQ thread drives callbacks, chunk bytes use asynchronous Pull/Push, temporary regions are released after completion, and the client records success only after the durable ACK. This is smoke evidence, not a replacement for the deterministic contract tests.
+
+## Final Regression
+
+Save logs locally and keep parallelism low:
+
+```bash
+mkdir -p tmp/test-logs
+CTEST_PARALLEL_LEVEL=1 ./test.sh --group unit >tmp/test-logs/rdma-unit.log 2>&1
+CTEST_PARALLEL_LEVEL=1 ./test.sh --group persistence >tmp/test-logs/rdma-persistence.log 2>&1
+```
+
+Do not advance a stage by skipping a failed test. Benchmarks, stress tests, and a multi-node performance gate are outside this feature.
