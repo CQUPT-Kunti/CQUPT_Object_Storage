@@ -129,6 +129,7 @@ set(PROTO_FILES
   ${PROTO_DIR}/metadata.proto
   ${VIEW_PROTO_SCHEMA}
   ${STORAGE_NODE_PROTO_SCHEMA}
+  ${PROTO_DIR}/rdma.proto
 )
 set(GRPC_PROTO_FILES
   ${PROTO_DIR}/raft.proto
@@ -155,6 +156,7 @@ set(PROTO_SRCS
   ${GENERATED_DIR}/metadata.pb.cc
   ${GENERATED_DIR}/view.pb.cc
   ${GENERATED_DIR}/storage_node.pb.cc
+  ${GENERATED_DIR}/rdma.pb.cc
 )
 set(PROTO_HDRS
   ${GENERATED_DIR}/common.pb.h
@@ -162,6 +164,7 @@ set(PROTO_HDRS
   ${GENERATED_DIR}/metadata.pb.h
   ${GENERATED_DIR}/view.pb.h
   ${GENERATED_DIR}/storage_node.pb.h
+  ${GENERATED_DIR}/rdma.pb.h
 )
 set(GRPC_SRCS
   ${GENERATED_DIR}/raft.grpc.pb.cc
@@ -293,12 +296,28 @@ target_link_libraries(storage_node_proto
     gRPC::grpc++
 )
 
+add_library(rdma_proto
+  ${GENERATED_DIR}/rdma.pb.cc
+  ${GENERATED_DIR}/rdma.pb.h
+)
+
+target_include_directories(rdma_proto
+  PUBLIC
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(rdma_proto
+  PUBLIC
+    protobuf::libprotobuf
+)
+
 if(WIN32)
   target_link_libraries(common_proto PUBLIC Ws2_32)
   target_link_libraries(raft_proto PUBLIC Ws2_32)
   target_link_libraries(metadata_proto PUBLIC Ws2_32)
   target_link_libraries(view_proto PUBLIC Ws2_32)
   target_link_libraries(storage_node_proto PUBLIC Ws2_32)
+  target_link_libraries(rdma_proto PUBLIC Ws2_32)
 endif()
 
 add_library(raft_core

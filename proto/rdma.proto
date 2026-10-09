@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package raft.rdma;
+
+option cc_generic_services = true;
+
+message ProbeRequest {
+  uint64 probe_id = 1;
+}
+
+message ProbeResponse {
+  uint64 probe_id = 1;
+  bool ok = 2;
+  string message = 3;
+}
+
+service RdmaControlService {
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+}

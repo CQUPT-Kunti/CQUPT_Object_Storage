@@ -5,7 +5,7 @@
 
 ## Stage 0 — Build Boundary
 
-- [ ] T001 Add `proto/rdma_control.proto` with `option cc_generic_services = true` and initial `Probe` messages/service; update root `CMakeLists.txt` to generate normal C++ Protobuf output only as `rdma_control_proto`.
+- [X] T001 Add `proto/rdma.proto` with `option cc_generic_services = true` and initial `Probe` messages/service; update root `CMakeLists.txt` to generate normal C++ Protobuf output only as `rdma_proto`.
 - [ ] T002 [P] Add `modules/rdma/AGENTS.md` and `modules/rdma/module-notes.md` documenting minimal asynchronous V1, per-connection completion-thread ownership, on-demand `RdmaMemoryRegion`, Push SlotPool/RECV-buffer exceptions, and the store-dependency prohibition.
 - [ ] T003 Add `CQUPT_RDMA={OFF,AUTO,REQUIRED}`, the root-wired `rdma_core` target with Linux `librdmacm` and `libibverbs` detection, portable unavailable backend in `modules/rdma/rdma_transport.{h,cpp}`, Linux source selection, and `rdma_transport_contract_test` in root/test CMake files; validate OFF/AUTO build and clear REQUIRED failure when either dependency is unsupported.
 
