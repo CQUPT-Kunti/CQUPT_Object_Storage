@@ -12,6 +12,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -19,14 +20,24 @@
 
 #include "rdma.pb.h"
 
+#if defined(__has_include)
+#if __has_include("rdma/rdma_connection.h")
+#include "rdma/rdma_connection.h"
+#define CQUPT_RDMA_CONTRACT_HAS_CONNECTION 1
+#endif
+#endif
+
 #if defined(CQUPT_RDMA_ENABLED) && CQUPT_RDMA_ENABLED
 #if defined(__has_include)
-#if __has_include("rdma/rdma_connection.h") && __has_include("rdma/rdma_server.h")
-#include "rdma/rdma_connection.h"
+#if __has_include("rdma/rdma_server.h")
 #include "rdma/rdma_server.h"
+#define CQUPT_RDMA_CONTRACT_HAS_SERVER 1
+#endif
+#endif
+#endif
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_CONNECTION) && defined(CQUPT_RDMA_CONTRACT_HAS_SERVER)
 #define CQUPT_RDMA_CONTRACT_HAS_ASYNC_IMPL 1
-#endif
-#endif
 #endif
 
 #ifndef CQUPT_RDMA_CONTRACT_HAS_ASYNC_IMPL
@@ -403,6 +414,139 @@ namespace
         EXPECT_EQ(response.probe_id(), 9u);
         EXPECT_FALSE(controller.Failed());
     }
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_CONNECTION)
+
+    std::uint8_t ReadUint8(const std::string& data, std::size_t offset)
+    {
+        return static_cast<std::uint8_t>(data[offset]);
+    }
+
+    std::uint16_t ReadUint16(const std::string& data, std::size_t offset)
+    {
+        return static_cast<std::uint16_t>(
+            static_cast<std::uint16_t>(ReadUint8(data, offset)) |
+            (static_cast<std::uint16_t>(ReadUint8(data, offset + 1)) << 8));
+    }
+
+    std::uint32_t ReadUint32(const std::string& data, std::size_t offset)
+    {
+        return static_cast<std::uint32_t>(
+            static_cast<std::uint32_t>(ReadUint8(data, offset)) |
+            (static_cast<std::uint32_t>(ReadUint8(data, offset + 1)) << 8) |
+            (static_cast<std::uint32_t>(ReadUint8(data, offset + 2)) << 16) |
+            (static_cast<std::uint32_t>(ReadUint8(data, offset + 3)) << 24));
+    }
+
+    class RecordingRdmaConnection final : public rdma::RdmaConnection
+    {
+    public:
+        RecordingRdmaConnection() : rdma::RdmaConnection("127.0.0.1", "0")
+        {
+        }
+
+        const std::string& captured_frame() const
+        {
+            return captured_frame_;
+        }
+
+        int submissions() const
+        {
+            return submissions_;
+        }
+
+    protected:
+        bool SubmitFramedRequest(std::string framed_request, std::string* error) override
+        {
+            captured_frame_ = std::move(framed_request);
+            ++submissions_;
+            if (error != nullptr)
+            {
+                error->clear();
+            }
+            return true;
+        }
+
+    private:
+        std::string captured_frame_;
+        int submissions_ = 0;
+    };
+
+    TEST(RdmaTransportContractTest, RdmaConnectionImplementsRpcChannel)
+    {
+        static_assert(std::is_base_of<google::protobuf::RpcChannel, rdma::RdmaConnection>::value,
+                      "RdmaConnection must implement google::protobuf::RpcChannel");
+        EXPECT_TRUE((std::is_base_of<google::protobuf::RpcChannel, rdma::RdmaConnection>::value));
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionSerializesAndFramesProbeRequest)
+    {
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(123);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(connection.submissions(), 1);
+        EXPECT_EQ(done.runs.load(), 0);
+        EXPECT_FALSE(controller.Failed());
+
+        const std::string& frame = connection.captured_frame();
+        constexpr std::size_t kHeaderSize = 14;
+        ASSERT_GE(frame.size(), kHeaderSize);
+        EXPECT_EQ(ReadUint16(frame, 0), 0u);
+
+        const std::uint32_t payload_length = ReadUint32(frame, 10);
+        ASSERT_EQ(frame.size(), kHeaderSize + payload_length);
+
+        raft::rdma::ProbeRequest decoded;
+        ASSERT_TRUE(decoded.ParseFromArray(frame.data() + kHeaderSize, static_cast<int>(payload_length)));
+        EXPECT_EQ(decoded.probe_id(), 123u);
+        EXPECT_EQ(response.probe_id(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionReportsSubmitFailureWithoutHanging)
+    {
+        rdma::RdmaConnection connection("127.0.0.1", "0");
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(321);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+        EXPECT_EQ(response.probe_id(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionRejectsNullCallArguments)
+    {
+        rdma::RdmaConnection connection("127.0.0.1", "0");
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        connection.CallMethod(raft::rdma::RdmaControlService::descriptor()->method(0),
+                              &controller,
+                              nullptr,
+                              &response,
+                              &done);
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+    }
+
+#endif
 
 #if CQUPT_RDMA_CONTRACT_HAS_ASYNC_IMPL
 
