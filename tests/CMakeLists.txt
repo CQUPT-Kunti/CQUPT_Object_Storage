@@ -1066,3 +1066,34 @@ add_raft_gtest(test_node_identity
 add_raft_gtest(cluster_config_test
   cluster_config_test.cpp
   "${RAFT_008_LABELS_BASELINE}")
+
+# =========================
+# 011 RDMA fast path:
+# build-boundary contract test for backend selection
+# (unavailable backend vs Linux librdmacm + libibverbs backend)
+# =========================
+if (TARGET rdma_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rdma_transport_contract_test.cpp")
+  add_executable(rdma_transport_contract_test
+    rdma_transport_contract_test.cpp
+  )
+
+  target_link_libraries(rdma_transport_contract_test
+    PRIVATE
+      rdma_core
+      GTest::gtest_main
+  )
+
+  target_include_directories(rdma_transport_contract_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_test(NAME rdma_transport_contract
+    COMMAND rdma_transport_contract_test
+  )
+  set_tests_properties(rdma_transport_contract PROPERTIES
+    LABELS "rdma-fast-path;platform-neutral;platform-neutral-fallback"
+  )
+else()
+  message(STATUS "Skip rdma_transport_contract_test: rdma_core target or rdma_transport_contract_test.cpp not found")
+endif()

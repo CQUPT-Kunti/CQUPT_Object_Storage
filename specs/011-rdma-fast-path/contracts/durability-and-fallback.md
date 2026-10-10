@@ -78,4 +78,4 @@ Push SlotPool MRs remain registered while their exported descriptors are valid. 
 
 ## Platform Contract
 
-`CQUPT_RDMA=REQUIRED` cannot silently fall back to an unavailable/no-op RDMA backend. On Linux, configuration or startup must return a clear error if either `librdmacm` or `libibverbs` is unavailable. `AUTO` may select the existing gRPC path before any RDMA attempt begins.
+`CQUPT_RDMA=ON` cannot silently fall back to an unavailable/no-op RDMA backend: missing `rdmacm`/`ibverbs` fail configure, compile, or link directly. `CQUPT_RDMA=OFF` keeps the existing gRPC path before any RDMA attempt begins.

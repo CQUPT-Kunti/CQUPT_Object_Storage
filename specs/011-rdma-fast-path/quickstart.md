@@ -4,21 +4,21 @@ This guide is for implementation and review. Complete one stage before starting 
 
 ## Stage 0 — Build Boundary
 
-Configure without requiring RDMA hardware:
+Configure with RDMA disabled (default):
 
 ```bash
 cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA=OFF
-cmake --build --preset debug-ninja-low-parallel
+cmake --build --preset debug-ninja-low-parallel --target rdma_core rdma_transport_contract_test
 ```
 
-Then verify automatic detection:
+Then configure with RDMA enabled:
 
 ```bash
-cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA=AUTO
-cmake --build --preset debug-ninja-low-parallel
+cmake --preset debug-ninja-low-parallel -DCQUPT_RDMA=ON
+cmake --build --preset debug-ninja-low-parallel --target rdma_core rdma_transport_contract_test
 ```
 
-Expected: `OFF` and unsupported `AUTO` build the explicit unavailable backend. `REQUIRED` must fail configuration clearly when `librdmacm`, `libibverbs`, or platform support is absent.
+Expected: `OFF` uses the explicit unavailable backend and does not require RDMA libraries. `ON` builds the Linux backend and links `ibverbs` and `rdmacm` directly; when either library is missing, configure, compile, or link fails directly, with no extra detection or fallback.
 
 ## Stage 1 — Minimal Async RpcChannel
 
@@ -68,7 +68,7 @@ Evidence required: the map contains only the current Client’s assigned pool, r
 
 ## Optional Hardware Smoke Test
 
-After the contract tests pass, run a single-node write on supported RDMA hardware with `CQUPT_RDMA=REQUIRED`. Confirm that `CallMethod()` returns before the response, the ordinary CQ thread drives callbacks, chunk bytes use asynchronous Pull/Push, temporary regions are released after completion, and the client records success only after the durable ACK. This is smoke evidence, not a replacement for the deterministic contract tests.
+After the contract tests pass, run a single-node write on supported RDMA hardware with `CQUPT_RDMA=ON`. Confirm that `CallMethod()` returns before the response, the ordinary CQ thread drives callbacks, chunk bytes use asynchronous Pull/Push, temporary regions are released after completion, and the client records success only after the durable ACK. This is smoke evidence, not a replacement for the deterministic contract tests.
 
 ## Final Regression
 

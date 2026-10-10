@@ -49,7 +49,7 @@ modules/rdma/
 └── rdma_slot_pool.h/.cpp
 ```
 
-The root build creates `rdma_core`; there is no module-local CMake file. `rdma_core` depends on Protobuf, `rdma_control_proto`, and conditionally `librdmacm` plus `libibverbs`, but not on store code. Store integration lives in `modules/store/node/storage_rdma_service.h/.cpp`. The existing `storage_node_app` target links `rdma_core` for the server/adapter path, and the existing `storage_client` target links it for the client path; the Raft core does not gain an RDMA dependency.
+The root build creates `rdma_core`; there is no module-local CMake file. `rdma_core` depends on Protobuf and `rdma_proto`, and with `CQUPT_RDMA=ON` it links `librdmacm` plus `libibverbs` directly, but not on store code. Store integration lives in `modules/store/node/storage_rdma_service.h/.cpp`. The existing `storage_node_app` target links `rdma_core` for the server/adapter path, and the existing `storage_client` target links it for the client path; the Raft core does not gain an RDMA dependency.
 
 `modules/rdma/` owns only generic connection, QP, on-demand MR, SEND/RECV, READ/WRITE, completion, and SlotPool infrastructure. `modules/store/node/storage_rdma_service.*` remains the Storage/RDMA adapter that understands `ChunkStore` and converts completed RDMA input into the existing storage write contract.
 
@@ -125,9 +125,9 @@ Fallback to gRPC is permitted only for `not_started` and `rejected_before_transf
 
 ### Stage 0 — Build Boundary
 
-- Add the explicit build mode (`OFF`, `AUTO`, `REQUIRED`) and clear `librdmacm`/`libibverbs` platform/dependency behavior.
-- Add `rdma_control_proto`, `rdma_core`, module documentation, and the focused test target.
-- Prove OFF/AUTO configure and compile without needing RDMA hardware.
+- Add the `CQUPT_RDMA` ON/OFF option (default OFF); when ON, `rdma_core` links `librdmacm` and `libibverbs` directly without dependency detection.
+- Add `rdma_proto`, `rdma_core`, module documentation, and the focused test target.
+- Prove OFF builds without RDMA libraries and ON builds/links against `librdmacm` and `libibverbs`.
 
 ### Stage 1 — Minimal Async RpcChannel + RDMA Connection
 
@@ -164,7 +164,7 @@ Each stage completes only its focused test and the smallest relevant existing re
 
 | Stage | Focused evidence |
 |---|---|
-| 0 | OFF/AUTO configure and build; REQUIRED fails clearly without both Linux RDMA libraries |
+| 0 | OFF builds without RDMA libraries; ON builds and links `librdmacm`/`libibverbs` |
 | 1 | CM lifecycle, one RC QP, immediate `CallMethod()` return, pending-map/CQ callback round trip, async server completion, and cleanup |
 | 2 | Async Pull checksum, on-demand temporary-MR lifetime/cleanup, durable ACK |
 | 3 | Per-client pool isolation, async same-QP WRITE-completion→READY, generation, durable ACK/reuse |

@@ -43,7 +43,7 @@ As a Push-mode client, I can mirror the slots assigned exclusively to my connect
 ## Functional Requirements
 
 - **FR-001**: The existing gRPC storage path MUST remain functional and be the only fallback path.
-- **FR-002**: RDMA MUST be optional at configure time and MUST fail clearly when explicitly requested but unavailable; it MUST NOT silently claim RDMA durability or transfer support.
+- **FR-002**: RDMA MUST be optional at configure time via a single `CQUPT_RDMA` ON/OFF switch (default OFF); when enabled, missing `rdmacm`/`ibverbs` MUST fail configure, compile, or link explicitly rather than silently degrading. It MUST NOT silently claim RDMA durability or transfer support.
 - **FR-003**: Control messages MUST remain Protobuf messages. A small control schema MUST generate the classic C++ `Service` and Stub interfaces needed by `google::protobuf::RpcChannel`.
 - **FR-004**: Stage 1 MUST provide an asynchronous `RdmaConnection : google::protobuf::RpcChannel`. In the MVP, one Client–StorageNode pair uses one `RdmaConnection`, which owns exactly one RC QP and a simple CQ completion thread.
 - **FR-005**: `RdmaConnection::CallMethod()` MUST allocate a `request_id`, serialize the request, create and register a minimal `PendingRpc`, post SEND on the RC QP, and return without waiting for the network response. The completion thread MUST match the response, parse it, update `RpcController`, remove the pending entry, and invoke `done` exactly once.
@@ -96,7 +96,7 @@ As a Push-mode client, I can mirror the slots assigned exclusively to my connect
 - **SC-003**: One targeted Push test proves per-client pool isolation, same-RC-QP WRITE→READY ordering, generation/state transitions, durable publication, acknowledgement, and reuse.
 - **SC-004**: One targeted fallback test covers every terminal state and demonstrates that no fallback occurs after uncertain remote execution.
 - **SC-005**: One targeted map test proves that only the current Client’s pool is mirrored, normal writes do not request ownership per chunk, and every required invalidation event is enforced.
-- **SC-006**: With RDMA disabled or unavailable in automatic mode, existing unit and persistence tests continue to pass through gRPC.
+- **SC-006**: With `CQUPT_RDMA=OFF`, existing unit and persistence tests continue to pass through gRPC.
 
 ## Assumptions
 

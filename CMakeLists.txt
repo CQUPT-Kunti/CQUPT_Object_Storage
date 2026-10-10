@@ -320,6 +320,55 @@ if(WIN32)
   target_link_libraries(rdma_proto PUBLIC Ws2_32)
 endif()
 
+# =========================
+# Optional RDMA fast path build boundary
+# =========================
+# CQUPT_RDMA=ON  : 编译 RDMA 模块，直接链接 rdmacm / ibverbs
+# CQUPT_RDMA=OFF : 不启用真实 RDMA，使用 portable unavailable backend，不影响原有 gRPC 路径
+option(CQUPT_RDMA "Enable RDMA support" OFF)
+
+if(CQUPT_RDMA)
+  add_library(rdma_core
+    modules/rdma/rdma_transport_linux.cpp
+  )
+else()
+  add_library(rdma_core
+    modules/rdma/rdma_transport.cpp
+  )
+endif()
+
+target_include_directories(rdma_core
+  PUBLIC
+    ${PROJECT_INCLUDE_DIR}
+)
+
+target_link_libraries(rdma_core
+  PUBLIC
+    rdma_proto
+)
+
+if(CQUPT_RDMA)
+  target_link_libraries(rdma_core
+    PRIVATE
+      ibverbs
+      rdmacm
+  )
+
+  target_compile_definitions(rdma_core
+    PUBLIC
+      CQUPT_RDMA_ENABLED=1
+  )
+
+  message(STATUS "CQUPT_RDMA=ON: building Linux RDMA backend (ibverbs + rdmacm)")
+else()
+  target_compile_definitions(rdma_core
+    PUBLIC
+      CQUPT_RDMA_ENABLED=0
+  )
+
+  message(STATUS "CQUPT_RDMA=OFF: using unavailable RDMA backend")
+endif()
+
 add_library(raft_core
   modules/store/common/store_types.cpp
   modules/store/chunk/chunk_store.cpp

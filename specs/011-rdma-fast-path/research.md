@@ -22,6 +22,8 @@ This document records decisions verified against the current repository. It repl
 
 **Repository fact**: The current project has no module-local CMake files; all source lists and targets are wired at the root. Therefore no `modules/rdma/CMakeLists.txt` is introduced.
 
+**Build switch**: A single `CQUPT_RDMA` ON/OFF option (default OFF) selects the backend. When ON, `rdma_core` links `librdmacm` and `libibverbs` directly without dependency detection, so missing libraries fail configure, compile, or link normally. When OFF, the portable unavailable backend is used and the existing paths keep building.
+
 **Store seam**: `modules/store/node/storage_rdma_service.h/.cpp` owns descriptor-to-write-request conversion and delegation to `ChunkStore::WriteChunk()`.
 
 **Build ownership**: The existing `storage_node_app` target links `rdma_core` for the server/adapter path, and `storage_client` links it for the client path. RDMA is not added as a Raft-core dependency.

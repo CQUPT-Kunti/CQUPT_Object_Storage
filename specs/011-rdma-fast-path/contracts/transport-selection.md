@@ -8,9 +8,8 @@ Transport selection applies only to storage-node chunk writes. Reads and all Vie
 
 | Mode | Startup/build behavior | Write behavior |
 |---|---|---|
-| `OFF` | Do not require `librdmacm`/`libibverbs`; expose explicit unavailable RDMA backend | Use gRPC |
-| `AUTO` | Enable RDMA when supported/configured | Prefer RDMA, otherwise choose gRPC before an RDMA attempt |
-| `REQUIRED` | Configuration/startup fails clearly if real RDMA or either required Linux library is unavailable | Prefer configured RDMA mode; never silently replace missing support |
+| `OFF` (default) | Do not require `rdmacm`/`ibverbs`; expose the explicit unavailable RDMA backend | Use gRPC |
+| `ON` | Build the RDMA module and link `rdmacm`/`ibverbs` directly; missing libraries fail configure/compile/link | Prefer RDMA, otherwise choose gRPC only through the attempt-state rules |
 
 Pull is the initial/default RDMA data mode. Push becomes selectable after Stage 3.
 
