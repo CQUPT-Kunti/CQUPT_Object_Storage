@@ -1,6 +1,7 @@
 #include "rdma/rdma_connection.h"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,6 +24,16 @@ namespace rdma
             {
                 out.push_back(static_cast<char>((value >> (8 * index)) & 0xFFu));
             }
+        }
+
+        std::uint64_t ReadLittleEndian(const unsigned char* data, int byte_count)
+        {
+            std::uint64_t value = 0;
+            for (int index = 0; index < byte_count; ++index)
+            {
+                value |= static_cast<std::uint64_t>(data[index]) << (8 * index);
+            }
+            return value;
         }
 
         std::string EncodeRequestFrame(const google::protobuf::MethodDescriptor& method,
@@ -132,12 +143,59 @@ namespace rdma
 
     void RdmaConnection::Close()
     {
+        OnTransportFailure("RdmaConnection closed before the RPC completed");
+    }
+
+    void RdmaConnection::OnTransportFailure(const std::string& reason)
+    {
         closed_.store(true, std::memory_order_release);
 
         const std::vector<PendingRpc> pending = DrainPendingRpcs();
         for (const PendingRpc& rpc : pending)
         {
-            FailPendingRpc(rpc, "RdmaConnection closed before the RPC completed");
+            FailPendingRpc(rpc, reason);
+        }
+    }
+
+    void RdmaConnection::OnRpcResponse(const void* data, std::size_t length)
+    {
+        if (data == nullptr || length < kFrameHeaderSize)
+        {
+            return;
+        }
+
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        const std::uint64_t request_id = ReadLittleEndian(bytes + 2, 8);
+        const std::uint64_t payload_length = ReadLittleEndian(bytes + 10, 4);
+
+        if (payload_length != static_cast<std::uint64_t>(length - kFrameHeaderSize) ||
+            payload_length > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+        {
+            const std::optional<PendingRpc> malformed = TakePendingRpc(request_id);
+            if (malformed.has_value())
+            {
+                FailPendingRpc(*malformed, "RdmaConnection: malformed RPC response frame");
+            }
+            return;
+        }
+
+        const std::optional<PendingRpc> pending = TakePendingRpc(request_id);
+        if (!pending.has_value())
+        {
+            return;
+        }
+
+        if (pending->response == nullptr ||
+            !pending->response->ParseFromArray(bytes + kFrameHeaderSize, static_cast<int>(payload_length)))
+        {
+            FailPendingRpc(*pending,
+                           "RdmaConnection: failed to parse RPC response for request " + std::to_string(request_id));
+            return;
+        }
+
+        if (pending->done != nullptr)
+        {
+            pending->done->Run();
         }
     }
 

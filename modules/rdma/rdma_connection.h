@@ -34,6 +34,8 @@ namespace rdma
                         google::protobuf::Closure* done) override;
 
         void Close();
+        void OnTransportFailure(const std::string& reason);
+        void OnRpcResponse(const void* data, std::size_t length);
         std::size_t pending_rpc_count() const;
 
     protected:

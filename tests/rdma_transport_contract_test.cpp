@@ -449,6 +449,40 @@ namespace
                (static_cast<std::uint64_t>(ReadUint32(data, offset + 4)) << 32);
     }
 
+    void AppendUint(std::string& out, std::uint64_t value, int byte_count)
+    {
+        for (int index = 0; index < byte_count; ++index)
+        {
+            out.push_back(static_cast<char>((value >> (8 * index)) & 0xFFu));
+        }
+    }
+
+    std::uint64_t RequestIdFromFrame(const std::string& frame)
+    {
+        return ReadUint64(frame, 2);
+    }
+
+    std::string BuildResponseFrame(std::uint64_t request_id, const std::string& payload)
+    {
+        std::string frame;
+        AppendUint(frame, 0, 2);
+        AppendUint(frame, request_id, 8);
+        AppendUint(frame, static_cast<std::uint64_t>(payload.size()), 4);
+        frame.append(payload);
+        return frame;
+    }
+
+    std::string SerializeProbeResponse(std::uint64_t probe_id, const std::string& message)
+    {
+        raft::rdma::ProbeResponse payload;
+        payload.set_probe_id(probe_id);
+        payload.set_ok(true);
+        payload.set_message(message);
+        std::string bytes;
+        payload.SerializeToString(&bytes);
+        return bytes;
+    }
+
     class RecordingRdmaConnection final : public rdma::RdmaConnection
     {
     public:
@@ -820,6 +854,256 @@ namespace
         EXPECT_FALSE(controller.ErrorText().empty());
         EXPECT_EQ(connection.pending_rpc_count(), 0u);
         EXPECT_EQ(connection.submissions(), 0);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionDispatchesResponseAndRunsDoneOnce)
+    {
+        TestRpcController controller;
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(1001);
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(done.runs.load(), 0);
+        ASSERT_EQ(connection.pending_rpc_count(), 1u);
+
+        const std::uint64_t request_id = RequestIdFromFrame(connection.captured_frame());
+        const std::string frame = BuildResponseFrame(request_id, SerializeProbeResponse(1001, "matched"));
+
+        connection.OnRpcResponse(frame.data(), frame.size());
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_EQ(response.probe_id(), 1001u);
+        EXPECT_TRUE(response.ok());
+        EXPECT_EQ(response.message(), "matched");
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+
+        connection.OnRpcResponse(frame.data(), frame.size());
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_EQ(response.message(), "matched");
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionMatchesOutOfOrderResponsesByRequestId)
+    {
+        TestRpcController controllers[3];
+        raft::rdma::ProbeResponse responses[3];
+        CountingClosure dones[3];
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        raft::rdma::ProbeRequest requests[3];
+
+        for (int index = 0; index < 3; ++index)
+        {
+            requests[index].set_probe_id(static_cast<std::uint64_t>(index + 1));
+            stub.Probe(&controllers[index], &requests[index], &responses[index], &dones[index]);
+        }
+
+        const std::vector<std::string> frames = connection.captured_frames();
+        ASSERT_EQ(frames.size(), 3u);
+
+        std::uint64_t ids[3];
+        for (int index = 0; index < 3; ++index)
+        {
+            ids[index] = RequestIdFromFrame(frames[index]);
+        }
+
+        const int response_order[3] = {2, 0, 1};
+        for (int step = 0; step < 3; ++step)
+        {
+            const int index = response_order[step];
+            const std::string frame = BuildResponseFrame(
+                ids[index],
+                SerializeProbeResponse(static_cast<std::uint64_t>(index + 1), "response-" + std::to_string(index + 1)));
+            connection.OnRpcResponse(frame.data(), frame.size());
+        }
+
+        for (int index = 0; index < 3; ++index)
+        {
+            EXPECT_EQ(dones[index].runs.load(), 1);
+            EXPECT_FALSE(controllers[index].Failed());
+            EXPECT_EQ(responses[index].probe_id(), static_cast<std::uint64_t>(index + 1));
+            EXPECT_EQ(responses[index].message(), "response-" + std::to_string(index + 1));
+        }
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionDropsUnknownRequestIdResponse)
+    {
+        TestRpcController controller;
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(5);
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        const std::uint64_t request_id = RequestIdFromFrame(connection.captured_frame());
+
+        const std::string unknown = BuildResponseFrame(request_id + 1000, SerializeProbeResponse(5, "unknown"));
+        connection.OnRpcResponse(unknown.data(), unknown.size());
+
+        EXPECT_EQ(done.runs.load(), 0);
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_EQ(response.probe_id(), 0u);
+        EXPECT_EQ(connection.pending_rpc_count(), 1u);
+
+        const std::string matching = BuildResponseFrame(request_id, SerializeProbeResponse(5, "known"));
+        connection.OnRpcResponse(matching.data(), matching.size());
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_EQ(response.message(), "known");
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionFailsMalformedPayloadWithoutAffectingOtherRpc)
+    {
+        TestRpcController first_controller;
+        raft::rdma::ProbeResponse first_response;
+        CountingClosure first_done;
+        TestRpcController second_controller;
+        raft::rdma::ProbeResponse second_response;
+        CountingClosure second_done;
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        raft::rdma::ProbeRequest first_request;
+        first_request.set_probe_id(1);
+        raft::rdma::ProbeRequest second_request;
+        second_request.set_probe_id(2);
+
+        stub.Probe(&first_controller, &first_request, &first_response, &first_done);
+        stub.Probe(&second_controller, &second_request, &second_response, &second_done);
+
+        const std::vector<std::string> frames = connection.captured_frames();
+        ASSERT_EQ(frames.size(), 2u);
+        const std::uint64_t first_id = RequestIdFromFrame(frames[0]);
+        const std::uint64_t second_id = RequestIdFromFrame(frames[1]);
+
+        const std::string malformed_payload(1, static_cast<char>(0x08));
+        const std::string malformed = BuildResponseFrame(first_id, malformed_payload);
+        connection.OnRpcResponse(malformed.data(), malformed.size());
+
+        EXPECT_EQ(first_done.runs.load(), 1);
+        EXPECT_TRUE(first_controller.Failed());
+        EXPECT_FALSE(first_controller.ErrorText().empty());
+
+        const std::string valid = BuildResponseFrame(second_id, SerializeProbeResponse(2, "second-ok"));
+        connection.OnRpcResponse(valid.data(), valid.size());
+
+        EXPECT_EQ(second_done.runs.load(), 1);
+        EXPECT_FALSE(second_controller.Failed());
+        EXPECT_EQ(second_response.probe_id(), 2u);
+        EXPECT_EQ(second_response.message(), "second-ok");
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionDropsIllegalResponseHeaderSafely)
+    {
+        TestRpcController controller;
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(3);
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        const std::uint64_t request_id = RequestIdFromFrame(connection.captured_frame());
+
+        const char short_header[] = {0x00, 0x01, 0x02};
+        connection.OnRpcResponse(short_header, sizeof(short_header));
+        connection.OnRpcResponse(nullptr, 0);
+
+        EXPECT_EQ(done.runs.load(), 0);
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_EQ(connection.pending_rpc_count(), 1u);
+
+        std::string mismatch;
+        AppendUint(mismatch, 0, 2);
+        AppendUint(mismatch, request_id, 8);
+        AppendUint(mismatch, 5, 4);
+        mismatch.append("ab");
+        connection.OnRpcResponse(mismatch.data(), mismatch.size());
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionCompletesRequestExactlyOnceUnderResponseAndCloseRace)
+    {
+        for (int iteration = 0; iteration < 20; ++iteration)
+        {
+            TestRpcController controller;
+            raft::rdma::ProbeResponse response;
+            CountingClosure done;
+            RecordingRdmaConnection connection;
+            raft::rdma::RdmaControlService::Stub stub(&connection);
+            raft::rdma::ProbeRequest request;
+            request.set_probe_id(static_cast<std::uint64_t>(iteration + 1));
+
+            stub.Probe(&controller, &request, &response, &done);
+
+            const std::uint64_t request_id = RequestIdFromFrame(connection.captured_frame());
+            const std::string frame = BuildResponseFrame(
+                request_id,
+                SerializeProbeResponse(static_cast<std::uint64_t>(iteration + 1), "race"));
+
+            std::thread responder([&connection, &frame]
+                                  { connection.OnRpcResponse(frame.data(), frame.size()); });
+            connection.Close();
+            responder.join();
+
+            EXPECT_EQ(done.runs.load(), 1);
+            EXPECT_EQ(connection.pending_rpc_count(), 0u);
+        }
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionTransportFailureFailsAllPendingRpcs)
+    {
+        TestRpcController controllers[2];
+        raft::rdma::ProbeResponse responses[2];
+        CountingClosure dones[2];
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        raft::rdma::ProbeRequest requests[2];
+
+        for (int index = 0; index < 2; ++index)
+        {
+            requests[index].set_probe_id(static_cast<std::uint64_t>(index + 1));
+            stub.Probe(&controllers[index], &requests[index], &responses[index], &dones[index]);
+        }
+        ASSERT_EQ(connection.pending_rpc_count(), 2u);
+
+        connection.OnTransportFailure("asynchronous transport failure");
+
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+        for (int index = 0; index < 2; ++index)
+        {
+            EXPECT_EQ(dones[index].runs.load(), 1);
+            EXPECT_TRUE(controllers[index].Failed());
+            EXPECT_EQ(controllers[index].ErrorText(), "asynchronous transport failure");
+        }
+
+        TestRpcController late_controller;
+        raft::rdma::ProbeResponse late_response;
+        CountingClosure late_done;
+        raft::rdma::ProbeRequest late_request;
+        late_request.set_probe_id(99);
+        stub.Probe(&late_controller, &late_request, &late_response, &late_done);
+
+        EXPECT_EQ(late_done.runs.load(), 1);
+        EXPECT_TRUE(late_controller.Failed());
+        EXPECT_EQ(connection.submissions(), 2);
     }
 
 #endif
