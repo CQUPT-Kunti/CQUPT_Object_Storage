@@ -33,6 +33,10 @@ namespace rdma
                         google::protobuf::Message* response,
                         google::protobuf::Closure* done) override;
 
+        bool Connect(std::string* error = nullptr);
+        bool connected() const;
+        std::size_t qp_count() const;
+
         void Close();
         void OnTransportFailure(const std::string& reason);
         void OnRpcResponse(const void* data, std::size_t length);

@@ -16,7 +16,9 @@ namespace rdma
 {
     namespace
     {
-        constexpr std::size_t kFrameHeaderSize = 14u;
+        constexpr std::size_t kRequestFrameHeaderSize = 14u;
+        constexpr std::size_t kResponseFrameHeaderSize = 18u;
+        constexpr std::uint32_t kRpcStatusOk = 0u;
 
         void AppendLittleEndian(std::string& out, std::uint64_t value, int byte_count)
         {
@@ -41,7 +43,7 @@ namespace rdma
                                        const std::string& payload)
         {
             std::string frame;
-            frame.reserve(kFrameHeaderSize + payload.size());
+            frame.reserve(kRequestFrameHeaderSize + payload.size());
             AppendLittleEndian(frame, static_cast<std::uint64_t>(method.index()), 2);
             AppendLittleEndian(frame, request_id, 8);
             AppendLittleEndian(frame, static_cast<std::uint64_t>(payload.size()), 4);
@@ -59,6 +61,25 @@ namespace rdma
     RdmaConnection::~RdmaConnection()
     {
         Close();
+    }
+
+    bool RdmaConnection::Connect(std::string* error)
+    {
+        if (error != nullptr)
+        {
+            *error = "RDMA transport connect is not implemented yet (T005 transport interface pending)";
+        }
+        return false;
+    }
+
+    bool RdmaConnection::connected() const
+    {
+        return false;
+    }
+
+    std::size_t RdmaConnection::qp_count() const
+    {
+        return 0;
     }
 
     void RdmaConnection::CallMethod(const google::protobuf::MethodDescriptor* method,
@@ -159,7 +180,7 @@ namespace rdma
 
     void RdmaConnection::OnRpcResponse(const void* data, std::size_t length)
     {
-        if (data == nullptr || length < kFrameHeaderSize)
+        if (data == nullptr || length < kResponseFrameHeaderSize)
         {
             return;
         }
@@ -167,8 +188,9 @@ namespace rdma
         const auto* bytes = static_cast<const unsigned char*>(data);
         const std::uint64_t request_id = ReadLittleEndian(bytes + 2, 8);
         const std::uint64_t payload_length = ReadLittleEndian(bytes + 10, 4);
+        const std::uint32_t status = static_cast<std::uint32_t>(ReadLittleEndian(bytes + 14, 4));
 
-        if (payload_length != static_cast<std::uint64_t>(length - kFrameHeaderSize) ||
+        if (payload_length != static_cast<std::uint64_t>(length - kResponseFrameHeaderSize) ||
             payload_length > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
         {
             const std::optional<PendingRpc> malformed = TakePendingRpc(request_id);
@@ -185,8 +207,19 @@ namespace rdma
             return;
         }
 
+        if (status != kRpcStatusOk)
+        {
+            const std::string remote_error =
+                payload_length > 0u
+                    ? std::string(reinterpret_cast<const char*>(bytes + kResponseFrameHeaderSize),
+                                  static_cast<std::size_t>(payload_length))
+                    : std::string("RdmaConnection: remote RPC failed");
+            FailPendingRpc(*pending, remote_error);
+            return;
+        }
+
         if (pending->response == nullptr ||
-            !pending->response->ParseFromArray(bytes + kFrameHeaderSize, static_cast<int>(payload_length)))
+            !pending->response->ParseFromArray(bytes + kResponseFrameHeaderSize, static_cast<int>(payload_length)))
         {
             FailPendingRpc(*pending,
                            "RdmaConnection: failed to parse RPC response for request " + std::to_string(request_id));
