@@ -25,6 +25,10 @@
 #include "rdma/rdma_connection.h"
 #define CQUPT_RDMA_CONTRACT_HAS_CONNECTION 1
 #endif
+#if __has_include("rdma/rdma_rpc_controller.h")
+#include "rdma/rdma_rpc_controller.h"
+#define CQUPT_RDMA_CONTRACT_HAS_CONTROLLER 1
+#endif
 #endif
 
 #if defined(CQUPT_RDMA_ENABLED) && CQUPT_RDMA_ENABLED
@@ -545,6 +549,196 @@ namespace
         EXPECT_TRUE(controller.Failed());
         EXPECT_FALSE(controller.ErrorText().empty());
     }
+
+#endif
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_CONTROLLER)
+
+    class ReentrantCancelClosure final : public google::protobuf::Closure
+    {
+    public:
+        explicit ReentrantCancelClosure(rdma::RdmaRpcController& controller)
+            : controller_(controller)
+        {
+        }
+
+        void Run() override
+        {
+            observed_canceled = controller_.IsCanceled();
+            observed_failed = controller_.Failed();
+            observed_error = controller_.ErrorText();
+            runs.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        std::atomic<int> runs{0};
+        std::atomic<bool> observed_canceled{false};
+        std::atomic<bool> observed_failed{false};
+        std::string observed_error;
+
+    private:
+        rdma::RdmaRpcController& controller_;
+    };
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerStartsInCleanState)
+    {
+        rdma::RdmaRpcController controller;
+
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_TRUE(controller.ErrorText().empty());
+        EXPECT_FALSE(controller.IsCanceled());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerSetFailedStoresReason)
+    {
+        rdma::RdmaRpcController controller;
+
+        controller.SetFailed("RDMA send failed");
+
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_EQ(controller.ErrorText(), "RDMA send failed");
+        EXPECT_FALSE(controller.IsCanceled());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerResetRestoresInitialState)
+    {
+        rdma::RdmaRpcController controller;
+        controller.SetFailed("RDMA send failed");
+        controller.StartCancel();
+
+        CountingClosure callback;
+        controller.NotifyOnCancel(&callback);
+        EXPECT_EQ(callback.runs.load(), 1);
+
+        controller.Reset();
+
+        EXPECT_FALSE(controller.Failed());
+        EXPECT_TRUE(controller.ErrorText().empty());
+        EXPECT_FALSE(controller.IsCanceled());
+
+        controller.StartCancel();
+        EXPECT_EQ(callback.runs.load(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerStartCancelSetsCanceled)
+    {
+        rdma::RdmaRpcController controller;
+
+        controller.StartCancel();
+
+        EXPECT_TRUE(controller.IsCanceled());
+        EXPECT_FALSE(controller.Failed());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerNotifiesCallbacksRegisteredBeforeCancel)
+    {
+        rdma::RdmaRpcController controller;
+        CountingClosure first;
+        CountingClosure second;
+        controller.NotifyOnCancel(&first);
+        controller.NotifyOnCancel(&second);
+
+        controller.StartCancel();
+
+        EXPECT_EQ(first.runs.load(), 1);
+        EXPECT_EQ(second.runs.load(), 1);
+
+        controller.StartCancel();
+        EXPECT_EQ(first.runs.load(), 1);
+        EXPECT_EQ(second.runs.load(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerNotifiesCallbackRegisteredAfterCancel)
+    {
+        rdma::RdmaRpcController controller;
+        controller.StartCancel();
+
+        CountingClosure callback;
+        controller.NotifyOnCancel(&callback);
+
+        EXPECT_EQ(callback.runs.load(), 1);
+
+        controller.StartCancel();
+        EXPECT_EQ(callback.runs.load(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerRunsCancelCallbackWithoutHoldingLock)
+    {
+        rdma::RdmaRpcController controller;
+        ReentrantCancelClosure callback(controller);
+        controller.NotifyOnCancel(&callback);
+
+        controller.StartCancel();
+
+        EXPECT_EQ(callback.runs.load(), 1);
+        EXPECT_TRUE(callback.observed_canceled.load());
+        EXPECT_FALSE(callback.observed_failed.load());
+        EXPECT_TRUE(callback.observed_error.empty());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaRpcControllerConcurrentAccessDoesNotRace)
+    {
+        rdma::RdmaRpcController controller;
+        constexpr int kThreadCount = 4;
+        constexpr int kIterations = 200;
+        std::atomic<bool> start{false};
+        std::vector<std::thread> threads;
+        threads.reserve(kThreadCount);
+
+        for (int index = 0; index < kThreadCount; ++index)
+        {
+            threads.emplace_back([&controller, &start, index]
+                                 {
+                                     while (!start.load())
+                                     {
+                                     }
+                                     for (int iteration = 0; iteration < kIterations; ++iteration)
+                                     {
+                                         if (index % 2 == 0)
+                                         {
+                                             controller.SetFailed("failure-" + std::to_string(iteration));
+                                         }
+                                         else
+                                         {
+                                             (void)controller.Failed();
+                                             (void)controller.ErrorText();
+                                         }
+                                         (void)controller.IsCanceled();
+                                     }
+                                 });
+        }
+
+        start.store(true);
+        for (std::thread& thread : threads)
+        {
+            thread.join();
+        }
+
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+        EXPECT_FALSE(controller.IsCanceled());
+    }
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_CONNECTION)
+
+    TEST(RdmaTransportContractTest, RdmaConnectionReportsImmediateFailureThroughRdmaRpcController)
+    {
+        rdma::RdmaConnection connection("127.0.0.1", "0");
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        rdma::RdmaRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(11);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+        EXPECT_EQ(response.probe_id(), 0u);
+    }
+
+#endif
 
 #endif
 

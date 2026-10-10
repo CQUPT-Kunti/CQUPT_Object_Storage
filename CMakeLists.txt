@@ -330,11 +330,13 @@ option(CQUPT_RDMA "Enable RDMA support" OFF)
 if(CQUPT_RDMA)
   add_library(rdma_core
     modules/rdma/rdma_connection.cpp
+    modules/rdma/rdma_rpc_controller.cpp
     modules/rdma/rdma_transport_linux.cpp
   )
 else()
   add_library(rdma_core
     modules/rdma/rdma_connection.cpp
+    modules/rdma/rdma_rpc_controller.cpp
     modules/rdma/rdma_transport.cpp
   )
 endif()
