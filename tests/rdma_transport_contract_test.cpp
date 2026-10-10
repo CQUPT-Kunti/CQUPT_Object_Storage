@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -442,6 +443,12 @@ namespace
             (static_cast<std::uint32_t>(ReadUint8(data, offset + 3)) << 24));
     }
 
+    std::uint64_t ReadUint64(const std::string& data, std::size_t offset)
+    {
+        return static_cast<std::uint64_t>(ReadUint32(data, offset)) |
+               (static_cast<std::uint64_t>(ReadUint32(data, offset + 4)) << 32);
+    }
+
     class RecordingRdmaConnection final : public rdma::RdmaConnection
     {
     public:
@@ -449,21 +456,35 @@ namespace
         {
         }
 
+        using rdma::RdmaConnection::DrainPendingRpcs;
+        using rdma::RdmaConnection::RegisterPendingRpc;
+        using rdma::RdmaConnection::TakePendingRpc;
+
         const std::string& captured_frame() const
         {
-            return captured_frame_;
+            std::lock_guard<std::mutex> lock(mutex_);
+            return frames_.back();
+        }
+
+        std::vector<std::string> captured_frames() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return frames_;
         }
 
         int submissions() const
         {
-            return submissions_;
+            return submissions_.load();
         }
 
     protected:
         bool SubmitFramedRequest(std::string framed_request, std::string* error) override
         {
-            captured_frame_ = std::move(framed_request);
-            ++submissions_;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                frames_.push_back(std::move(framed_request));
+            }
+            submissions_.fetch_add(1);
             if (error != nullptr)
             {
                 error->clear();
@@ -472,8 +493,9 @@ namespace
         }
 
     private:
-        std::string captured_frame_;
-        int submissions_ = 0;
+        mutable std::mutex mutex_;
+        std::vector<std::string> frames_;
+        std::atomic<int> submissions_{0};
     };
 
     TEST(RdmaTransportContractTest, RdmaConnectionImplementsRpcChannel)
@@ -485,13 +507,13 @@ namespace
 
     TEST(RdmaTransportContractTest, RdmaConnectionSerializesAndFramesProbeRequest)
     {
-        RecordingRdmaConnection connection;
-        raft::rdma::RdmaControlService::Stub stub(&connection);
         TestRpcController controller;
         raft::rdma::ProbeRequest request;
         request.set_probe_id(123);
         raft::rdma::ProbeResponse response;
         CountingClosure done;
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
 
         stub.Probe(&controller, &request, &response, &done);
 
@@ -548,6 +570,256 @@ namespace
         EXPECT_EQ(done.runs.load(), 1);
         EXPECT_TRUE(controller.Failed());
         EXPECT_FALSE(controller.ErrorText().empty());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionAssignsUniqueIncreasingRequestIds)
+    {
+        TestRpcController controllers[3];
+        raft::rdma::ProbeRequest requests[3];
+        raft::rdma::ProbeResponse responses[3];
+        CountingClosure dones[3];
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+
+        for (int index = 0; index < 3; ++index)
+        {
+            requests[index].set_probe_id(static_cast<std::uint64_t>(index + 1));
+            stub.Probe(&controllers[index], &requests[index], &responses[index], &dones[index]);
+        }
+
+        const std::vector<std::string> frames = connection.captured_frames();
+        ASSERT_EQ(frames.size(), 3u);
+
+        std::vector<std::uint64_t> ids;
+        ids.reserve(frames.size());
+        for (const std::string& frame : frames)
+        {
+            ASSERT_GE(frame.size(), 14u);
+            ids.push_back(ReadUint64(frame, 2));
+        }
+
+        EXPECT_GE(ids[0], 1u);
+        EXPECT_LT(ids[0], ids[1]);
+        EXPECT_LT(ids[1], ids[2]);
+        EXPECT_EQ(connection.pending_rpc_count(), 3u);
+        for (int index = 0; index < 3; ++index)
+        {
+            EXPECT_EQ(dones[index].runs.load(), 0);
+        }
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionRegistersPendingRpcBeforeSubmitAndTakesOnce)
+    {
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(55);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        ASSERT_EQ(connection.submissions(), 1);
+        ASSERT_EQ(connection.pending_rpc_count(), 1u);
+
+        const std::vector<std::string> frames = connection.captured_frames();
+        ASSERT_EQ(frames.size(), 1u);
+        const std::uint64_t request_id = ReadUint64(frames.front(), 2);
+
+        const std::optional<rdma::PendingRpc> taken = connection.TakePendingRpc(request_id);
+        ASSERT_TRUE(taken.has_value());
+        EXPECT_EQ(taken->request_id, request_id);
+        EXPECT_EQ(taken->controller, &controller);
+        EXPECT_EQ(taken->response, &response);
+        EXPECT_EQ(taken->done, &done);
+        EXPECT_EQ(done.runs.load(), 0);
+
+        EXPECT_FALSE(connection.TakePendingRpc(request_id).has_value());
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionKeepsPendingRpcAfterSuccessfulSubmit)
+    {
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(66);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(connection.submissions(), 1);
+        EXPECT_EQ(connection.pending_rpc_count(), 1u);
+        EXPECT_EQ(done.runs.load(), 0);
+
+        const std::vector<rdma::PendingRpc> drained = connection.DrainPendingRpcs();
+        EXPECT_EQ(drained.size(), 1u);
+        EXPECT_EQ(done.runs.load(), 0);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionRegistersAndTakesPendingRpcExactlyOnce)
+    {
+        RecordingRdmaConnection connection;
+        TestRpcController controller;
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        rdma::PendingRpc pending;
+        pending.request_id = 42;
+        pending.controller = &controller;
+        pending.response = &response;
+        pending.done = &done;
+
+        EXPECT_TRUE(connection.RegisterPendingRpc(pending));
+        EXPECT_FALSE(connection.RegisterPendingRpc(pending));
+        EXPECT_EQ(connection.pending_rpc_count(), 1u);
+
+        const std::optional<rdma::PendingRpc> taken = connection.TakePendingRpc(42);
+        ASSERT_TRUE(taken.has_value());
+        EXPECT_EQ(taken->request_id, 42u);
+        EXPECT_FALSE(connection.TakePendingRpc(42).has_value());
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionConcurrentCallsProduceDistinctPendingIds)
+    {
+        constexpr int kThreadCount = 4;
+        constexpr int kCallsPerThread = 25;
+        constexpr int kTotalCalls = kThreadCount * kCallsPerThread;
+
+        std::vector<std::unique_ptr<TestRpcController>> controllers;
+        std::vector<std::unique_ptr<raft::rdma::ProbeRequest>> requests;
+        std::vector<std::unique_ptr<raft::rdma::ProbeResponse>> responses;
+        std::vector<std::unique_ptr<CountingClosure>> dones;
+        for (int index = 0; index < kTotalCalls; ++index)
+        {
+            controllers.push_back(std::make_unique<TestRpcController>());
+            requests.push_back(std::make_unique<raft::rdma::ProbeRequest>());
+            responses.push_back(std::make_unique<raft::rdma::ProbeResponse>());
+            dones.push_back(std::make_unique<CountingClosure>());
+        }
+
+        RecordingRdmaConnection connection;
+        std::atomic<bool> start{false};
+        std::vector<std::thread> threads;
+        threads.reserve(kThreadCount);
+
+        for (int thread_index = 0; thread_index < kThreadCount; ++thread_index)
+        {
+            threads.emplace_back([&connection, &start, &controllers, &requests, &responses, &dones, thread_index]
+                                 {
+                                     while (!start.load())
+                                     {
+                                     }
+                                     raft::rdma::RdmaControlService::Stub stub(&connection);
+                                     for (int call = 0; call < kCallsPerThread; ++call)
+                                     {
+                                         const int index = thread_index * kCallsPerThread + call;
+                                         requests[index]->set_probe_id(static_cast<std::uint64_t>(index + 1));
+                                         stub.Probe(controllers[index].get(),
+                                                    requests[index].get(),
+                                                    responses[index].get(),
+                                                    dones[index].get());
+                                     }
+                                 });
+        }
+
+        start.store(true);
+        for (std::thread& thread : threads)
+        {
+            thread.join();
+        }
+
+        EXPECT_EQ(connection.pending_rpc_count(), static_cast<std::size_t>(kTotalCalls));
+
+        const std::vector<std::string> frames = connection.captured_frames();
+        ASSERT_EQ(frames.size(), static_cast<std::size_t>(kTotalCalls));
+
+        std::vector<std::uint64_t> ids;
+        ids.reserve(frames.size());
+        for (const std::string& frame : frames)
+        {
+            ASSERT_GE(frame.size(), 14u);
+            ids.push_back(ReadUint64(frame, 2));
+        }
+        std::sort(ids.begin(), ids.end());
+        EXPECT_GE(ids.front(), 1u);
+        EXPECT_EQ(std::adjacent_find(ids.begin(), ids.end()), ids.end());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionRemovesPendingRpcAfterSubmitFailure)
+    {
+        rdma::RdmaConnection connection("127.0.0.1", "0");
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(77);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionCloseFailsAllPendingRpcsExactlyOnce)
+    {
+        RecordingRdmaConnection connection;
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controllers[3];
+        raft::rdma::ProbeRequest requests[3];
+        raft::rdma::ProbeResponse responses[3];
+        CountingClosure dones[3];
+
+        for (int index = 0; index < 3; ++index)
+        {
+            requests[index].set_probe_id(static_cast<std::uint64_t>(100 + index));
+            stub.Probe(&controllers[index], &requests[index], &responses[index], &dones[index]);
+        }
+        ASSERT_EQ(connection.pending_rpc_count(), 3u);
+
+        connection.Close();
+
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+        for (int index = 0; index < 3; ++index)
+        {
+            EXPECT_EQ(dones[index].runs.load(), 1);
+            EXPECT_TRUE(controllers[index].Failed());
+            EXPECT_FALSE(controllers[index].ErrorText().empty());
+        }
+
+        connection.Close();
+        for (int index = 0; index < 3; ++index)
+        {
+            EXPECT_EQ(dones[index].runs.load(), 1);
+        }
+    }
+
+    TEST(RdmaTransportContractTest, RdmaConnectionRejectsNewRpcAfterClose)
+    {
+        RecordingRdmaConnection connection;
+        connection.Close();
+
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        request.set_probe_id(88);
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+
+        stub.Probe(&controller, &request, &response, &done);
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_FALSE(controller.ErrorText().empty());
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+        EXPECT_EQ(connection.submissions(), 0);
     }
 
 #endif

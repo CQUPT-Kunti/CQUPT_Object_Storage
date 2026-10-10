@@ -1,8 +1,10 @@
 #include "rdma/rdma_connection.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
@@ -13,7 +15,6 @@ namespace rdma
 {
     namespace
     {
-        constexpr std::uint64_t kUnassignedRequestId = 0u;
         constexpr std::size_t kFrameHeaderSize = 14u;
 
         void AppendLittleEndian(std::string& out, std::uint64_t value, int byte_count)
@@ -44,7 +45,10 @@ namespace rdma
     {
     }
 
-    RdmaConnection::~RdmaConnection() = default;
+    RdmaConnection::~RdmaConnection()
+    {
+        Close();
+    }
 
     void RdmaConnection::CallMethod(const google::protobuf::MethodDescriptor* method,
                                     google::protobuf::RpcController* controller,
@@ -65,6 +69,16 @@ namespace rdma
             return;
         }
 
+        if (closed_.load(std::memory_order_acquire))
+        {
+            if (controller != nullptr)
+            {
+                controller->SetFailed("RdmaConnection is closed");
+            }
+            done->Run();
+            return;
+        }
+
         std::string payload;
         if (!request->SerializeToString(&payload))
         {
@@ -76,18 +90,61 @@ namespace rdma
             return;
         }
 
-        std::string framed_request = EncodeRequestFrame(*method, kUnassignedRequestId, payload);
-
-        std::string error;
-        if (!SubmitFramedRequest(std::move(framed_request), &error))
+        const std::optional<std::uint64_t> request_id = NextRequestId();
+        if (!request_id.has_value())
         {
             if (controller != nullptr)
             {
-                controller->SetFailed(error.empty() ? "RdmaConnection: request submission failed" : error);
+                controller->SetFailed("RdmaConnection: request id space is exhausted");
             }
             done->Run();
             return;
         }
+
+        PendingRpc pending;
+        pending.request_id = *request_id;
+        pending.controller = controller;
+        pending.response = response;
+        pending.done = done;
+
+        if (!RegisterPendingRpc(pending))
+        {
+            if (controller != nullptr)
+            {
+                controller->SetFailed("RdmaConnection is closed");
+            }
+            done->Run();
+            return;
+        }
+
+        std::string framed_request = EncodeRequestFrame(*method, pending.request_id, payload);
+
+        std::string error;
+        if (!SubmitFramedRequest(std::move(framed_request), &error))
+        {
+            const std::optional<PendingRpc> failed = TakePendingRpc(pending.request_id);
+            if (failed.has_value())
+            {
+                FailPendingRpc(*failed, error.empty() ? "RdmaConnection: request submission failed" : error);
+            }
+        }
+    }
+
+    void RdmaConnection::Close()
+    {
+        closed_.store(true, std::memory_order_release);
+
+        const std::vector<PendingRpc> pending = DrainPendingRpcs();
+        for (const PendingRpc& rpc : pending)
+        {
+            FailPendingRpc(rpc, "RdmaConnection closed before the RPC completed");
+        }
+    }
+
+    std::size_t RdmaConnection::pending_rpc_count() const
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        return pending_rpcs_.size();
     }
 
     bool RdmaConnection::SubmitFramedRequest(std::string framed_request, std::string* error)
@@ -107,5 +164,70 @@ namespace rdma
             }
         }
         return false;
+    }
+
+    bool RdmaConnection::RegisterPendingRpc(PendingRpc pending)
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (closed_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        return pending_rpcs_.emplace(pending.request_id, pending).second;
+    }
+
+    std::optional<PendingRpc> RdmaConnection::TakePendingRpc(std::uint64_t request_id)
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        const auto entry = pending_rpcs_.find(request_id);
+        if (entry == pending_rpcs_.end())
+        {
+            return std::nullopt;
+        }
+
+        const PendingRpc pending = entry->second;
+        pending_rpcs_.erase(entry);
+        return pending;
+    }
+
+    std::vector<PendingRpc> RdmaConnection::DrainPendingRpcs()
+    {
+        std::vector<PendingRpc> pending;
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending.reserve(pending_rpcs_.size());
+        for (const auto& entry : pending_rpcs_)
+        {
+            pending.push_back(entry.second);
+        }
+        pending_rpcs_.clear();
+        return pending;
+    }
+
+    std::optional<std::uint64_t> RdmaConnection::NextRequestId()
+    {
+        if (request_id_exhausted_.load(std::memory_order_acquire))
+        {
+            return std::nullopt;
+        }
+
+        const std::uint64_t request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+        if (request_id == 0)
+        {
+            request_id_exhausted_.store(true, std::memory_order_release);
+            return std::nullopt;
+        }
+        return request_id;
+    }
+
+    void RdmaConnection::FailPendingRpc(const PendingRpc& pending, const std::string& reason)
+    {
+        if (pending.controller != nullptr)
+        {
+            pending.controller->SetFailed(reason);
+        }
+        if (pending.done != nullptr)
+        {
+            pending.done->Run();
+        }
     }
 }
