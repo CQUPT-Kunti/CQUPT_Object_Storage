@@ -1614,6 +1614,26 @@ namespace
         EXPECT_TRUE(region->Release(&error));
     }
 
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionRegistersWithRemoteWriteAccessForPushTarget)
+    {
+        IbvProtectionDomainScope scope;
+        std::string error;
+        if (!scope.Open(&error))
+        {
+            GTEST_SKIP() << error;
+        }
+
+        std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(4096, &error);
+        ASSERT_NE(region, nullptr) << error;
+
+        ASSERT_TRUE(region->Register(scope.pd(), IBV_ACCESS_REMOTE_WRITE, &error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kRegistered);
+        EXPECT_NE(region->rkey(), 0u);
+
+        ASSERT_TRUE(region->Release(&error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+    }
+
 #endif
 
 #endif
@@ -3838,6 +3858,216 @@ namespace
     }
 
 #endif
+
+    TEST(RdmaTransportContractTest, PushWritePostReturnsBeforeCompletionAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013 asynchronous Push: posting the RDMA WRITE must return before the "
+                        "WRITE completion is processed, without assuming the completion runs after the call returns";
+    }
+
+    TEST(RdmaTransportContractTest, PushWriteBufferLifetimeAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013 and the T009 MR contract: the client WRITE buffer/MR must remain valid "
+                        "until the WRITE completion is processed";
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyIsPostedFromWriteCompletionOnSameRcQpAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: the WRITE completion callback must post READY as a SEND on the same "
+                        "RdmaConnection and RC QP used for the WRITE";
+    }
+
+    TEST(RdmaTransportContractTest, PushFailedWriteCompletionDoesNotPostReadyAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: a failed WRITE completion must not post or cause a successful READY";
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyCarriesSlotChunkAndGenerationAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012 READY control messages and T013: READY must identify the slot, chunk "
+                        "identity, pool/slot generation, and length for the completed WRITE";
+    }
+
+    TEST(RdmaTransportContractTest, PushClientSlotPoolsAreConnectionScopedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012 SlotPool: each Client connection receives descriptors for its own pool only";
+    }
+
+    TEST(RdmaTransportContractTest, PushSameSlotIdAcrossPoolsIsNotInterchangeableAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012/T013: identical slot_id values in two client pools must never be "
+                        "interchangeable across connections";
+    }
+
+    TEST(RdmaTransportContractTest, PushPoolExhaustionDoesNotAffectOtherClientAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: exhausting Client A’s pool must not change any Client B slot state";
+    }
+
+    TEST(RdmaTransportContractTest, PushClientMirrorNeverOverridesStoreAuthorityAwaitsT012T019)
+    {
+        GTEST_SKIP() << "requires T012 and T019: the client-side slot mirror must not replace store-side "
+                        "ownership and generation validation";
+    }
+
+    TEST(RdmaTransportContractTest, PushSlotStateMachineFollowsFreeWritingReadyFlushingFreeAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012 SlotPool: slots must follow FREE -> WRITING -> READY -> FLUSHING -> FREE";
+    }
+
+    TEST(RdmaTransportContractTest, PushIllegalSlotTransitionsAreRejectedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: WRITING -> FREE before safe completion, FLUSHING -> WRITING, and "
+                        "READY -> WRITING must all be rejected";
+    }
+
+    TEST(RdmaTransportContractTest, PushBusySlotCannotBeReallocatedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: a slot in WRITING/READY/FLUSHING must not be selected again";
+    }
+
+    TEST(RdmaTransportContractTest, PushStaleConnectionGenerationIsRejectedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: a READY/descriptor bound to a stale connection generation must be rejected";
+    }
+
+    TEST(RdmaTransportContractTest, PushStalePoolGenerationIsRejectedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: a descriptor from an older pool generation must be rejected after "
+                        "a pool refresh/reconnect";
+    }
+
+    TEST(RdmaTransportContractTest, PushStaleSlotGenerationIsRejectedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: a slot whose generation no longer matches the authoritative pool "
+                        "generation must be rejected";
+    }
+
+    TEST(RdmaTransportContractTest, PushReconnectAndStoreRestartInvalidateOldDescriptorsAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: reconnect and store restart must invalidate old slot descriptors";
+    }
+
+    TEST(RdmaTransportContractTest, PushSameSlotIdDifferentGenerationIsRejectedAwaitsT012)
+    {
+        GTEST_SKIP() << "requires T012: the same slot_id with a different generation must not be treated as "
+                        "the same writable slot";
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyWithoutWriteIsRejectedAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: READY without a corresponding completed WRITE must be rejected and must "
+                        "not persist data";
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyForWrongSlotIsRejectedAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: READY naming a slot outside the connection’s pool must be rejected";
+    }
+
+    TEST(RdmaTransportContractTest, PushStaleGenerationReadyIsRejectedAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: READY with a stale pool/slot generation must be rejected";
+    }
+
+    TEST(RdmaTransportContractTest, PushDuplicateReadyIsRejectedAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: a second READY for the same slot/chunk must not publish or ACK twice";
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyExceedingSlotCapacityIsRejectedAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: READY with length greater than the slot capacity must be rejected";
+    }
+
+    TEST(RdmaTransportContractTest, PushNoDurableAckBeforeStoreWriteAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: WRITE completion and READY must not produce a durable ACK before "
+                        "ChunkStore::WriteChunk() runs";
+    }
+
+    TEST(RdmaTransportContractTest, PushStoreFailureReturnsFailureNotDurableAckAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: a failed ChunkStore::WriteChunk() must return failure without durable ACK";
+    }
+
+    TEST(RdmaTransportContractTest, PushDurableAckOnlyAfterWriteChunkSuccessAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: durable success may be emitted only after ChunkStore::WriteChunk() "
+                        "reports durable success";
+    }
+
+    TEST(RdmaTransportContractTest, PushChecksumMismatchAndConflictDoNotPublishAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: checksum mismatch and identity conflict must not be published, while "
+                        "compatible duplicates follow the existing WriteChunk idempotent semantics";
+    }
+
+    TEST(RdmaTransportContractTest, PushSlotReuseOnlyAfterDurableAckAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012/T013: a slot may return to FREE and be reused only after the durable "
+                        "result and safe completion of DMA and store use";
+    }
+
+    TEST(RdmaTransportContractTest, PushSlotReuseRequiresSafeDmaAndStoreCompletionAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: an error path must still wait for DMA and store usage to end before "
+                        "declaring the slot reusable";
+    }
+
+    TEST(RdmaTransportContractTest, PushSecondWriteDoesNotCorruptFirstChunkAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012/T013: a second WRITE reusing a slot must not corrupt the first chunk "
+                        "already persisted and ACKed";
+    }
+
+    TEST(RdmaTransportContractTest, PushRejectsWhenNoFreeSlotBeforeWriteAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012/T013: temporary exhaustion of the client’s own pool must be rejected "
+                        "before posting RDMA WRITE";
+    }
+
+    TEST(RdmaTransportContractTest, PushRejectsInsufficientSlotCapacityBeforeWriteAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012/T013: when no assigned slot has sufficient capacity, the write must be "
+                        "rejected before posting RDMA WRITE";
+    }
+
+    TEST(RdmaTransportContractTest, PushOversizedChunkIsInvalidNotResourceExhaustionAwaitsT012T013)
+    {
+        GTEST_SKIP() << "requires T012/T013: a chunk above the system maximum must be invalid input, not "
+                        "temporary resource exhaustion";
+    }
+
+    TEST(RdmaTransportContractTest, PushPreTransferResourceRejectionMapsToRejectedBeforeTransferAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: a resource rejection before any remote data operation maps to "
+                        "rejected_before_transfer and never to success";
+    }
+
+    TEST(RdmaTransportContractTest, PushPostWriteUnknownStateMapsToRemoteStateUncertainAwaitsT014)
+    {
+        GTEST_SKIP() << "requires T013/T014: a connection failure after posting RDMA WRITE maps to "
+                        "remote_state_uncertain, not rejected_before_transfer";
+    }
+
+    TEST(RdmaTransportContractTest, PushAsyncContextOutlivesWriteReadyAndStorePhasesAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: WRITE, READY, and store contexts must remain valid across their "
+                        "asynchronous phases and be released only after the RPC completes";
+    }
+
+    TEST(RdmaTransportContractTest, PushCloseDuringReadyDoesNotDoubleCompleteAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: connection close racing with READY/store completion must not run the "
+                        "completion closure twice";
+    }
+
+    TEST(RdmaTransportContractTest, PushDisconnectInvalidatesSlotsWithoutReuseAwaitsT013)
+    {
+        GTEST_SKIP() << "requires T013: after disconnect the store must not treat invalidated slots as safely "
+                        "reusable without reconciliation";
+    }
 
 #endif
 }

@@ -36,7 +36,7 @@
 
 **Goal**: A fixed SlotPool per Client connection supports bounded RDMA WRITE with generation safety and no global slot competition.
 
-- [ ] T011 [US3] Extend `tests/rdma_transport_contract_test.cpp` with Push cases for immediate return after posting WRITE, WRITE-CQE callback posting READY on the same RC QP, per-client pool isolation, `FREE → WRITING → READY → FLUSHING → FREE`, stale pool/slot generation, ready-before-write rejection, durable ACK, safe reuse, and pre-transfer capacity/resource rejection.
+- [X] T011 [US3] Extend `tests/rdma_transport_contract_test.cpp` with Push cases for immediate return after posting WRITE, WRITE-CQE callback posting READY on the same RC QP, per-client pool isolation, `FREE → WRITING → READY → FLUSHING → FREE`, stale pool/slot generation, ready-before-write rejection, durable ACK, safe reuse, and pre-transfer capacity/resource rejection.
 - [ ] T012 [US3] Implement authoritative connection-scoped SlotPools plus the minimal connection-scoped `RemoteSlotMap` mirror in `modules/rdma/rdma_slot_pool.h/.cpp`; add pool initialization/fetch and READY/COMMIT messages to `proto/rdma_control.proto`, with no global pool, cross-client CAS, or per-chunk `AcquireSlot`/`ReleaseSlot` path.
 - [ ] T013 [US3] Implement asynchronous Push handling in `modules/store/node/storage_rdma_service.cpp`, including WRITE-completion callback→same-RC-QP READY, retained server response context, and delegation to `ChunkStore::WriteChunk()` before durable ACK; wire `storage_node_app` directly to `rdma_core` for RDMA server lifecycle without changing gRPC service behavior.
 
