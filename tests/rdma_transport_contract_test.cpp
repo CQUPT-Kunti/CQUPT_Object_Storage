@@ -6,7 +6,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,6 +40,11 @@
 #if __has_include("rdma/rdma_memory_region.h")
 #include "rdma/rdma_memory_region.h"
 #define CQUPT_RDMA_CONTRACT_HAS_MEMORY_REGION 1
+#endif
+#if __has_include("store/node/storage_rdma_service.h")
+#include "store/node/storage_rdma_service.h"
+#include "store/runtime/storage_executor.h"
+#define CQUPT_RDMA_CONTRACT_HAS_STORAGE_RDMA_SERVICE 1
 #endif
 #endif
 
@@ -3102,6 +3110,734 @@ namespace
         EXPECT_EQ(done.runs(), 1);
         EXPECT_TRUE(controller.Failed());
     }
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_STORAGE_RDMA_SERVICE)
+
+    // 生成合法 chunk_id（object-1 / version 7 / chunk_index 0）。
+    std::string MakeValidPullChunkId()
+    {
+        std::string chunk_id;
+        storedemo::MakeChunkId("object-1", 7, 0, &chunk_id, nullptr);
+        return chunk_id;
+    }
+
+    // 用现有 store 算法计算 SHA256 并映射成 proto checksum。
+    raft::rdma::RdmaChunkChecksum MakePullChecksum(const std::string& payload)
+    {
+        storedemo::ChunkChecksum checksum;
+        storedemo::ComputeChunkChecksum(payload, &checksum, nullptr);
+
+        raft::rdma::RdmaChunkChecksum proto;
+        proto.set_algorithm(raft::rdma::RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256);
+        proto.set_value(checksum.value);
+        proto.set_size_bytes(checksum.size_bytes);
+        return proto;
+    }
+
+    // 构造 kOk + durable 的 WriteChunkResponse。
+    storedemo::WriteChunkResponse MakeDurableWriteResponse(const std::string& chunk_id)
+    {
+        storedemo::WriteChunkResponse response;
+        response.status = storedemo::StorageNodeStatusCode::kOk;
+        response.durable = true;
+        response.metadata.identity.chunk_id = chunk_id;
+        return response;
+    }
+
+    // 记录完成顺序（"ack"）并支持带超时等待的 Closure。
+    class OrderingClosure final : public google::protobuf::Closure
+    {
+    public:
+        explicit OrderingClosure(std::shared_ptr<std::vector<std::string>> order)
+            : order_(std::move(order))
+        {
+        }
+
+        // 记录回调发生并唤醒等待者。
+        void Run() override
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++runs_;
+                if (order_ != nullptr)
+                {
+                    order_->push_back("ack");
+                }
+            }
+            cv_.notify_all();
+        }
+
+        // 等待回调至少执行 expected 次。
+        bool WaitForRuns(int expected, std::chrono::milliseconds timeout)
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            return cv_.wait_for(lock, timeout, [this, expected] { return runs_ >= expected; });
+        }
+
+        // 返回当前回调次数。
+        int runs() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return runs_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        std::condition_variable cv_;
+        std::shared_ptr<std::vector<std::string>> order_;
+        int runs_ = 0;
+    };
+
+    // ChunkStore 测试替身：记录 WriteChunk 请求/次数，返回可配置结果并写顺序日志。
+    class RecordingChunkStore final : public storedemo::ChunkStore
+    {
+    public:
+        explicit RecordingChunkStore(std::shared_ptr<std::vector<std::string>> order)
+            : order_(std::move(order))
+        {
+        }
+
+        // 记录一次 WriteChunk 调用，返回 set_response 配置的结果。
+        storedemo::WriteChunkResponse WriteChunk(const storedemo::WriteChunkRequest& request) override
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++write_calls_;
+            last_request_ = request;
+            if (order_ != nullptr)
+            {
+                order_->push_back("store");
+            }
+            return response_;
+        }
+
+        // Pull 测试不使用读取接口，返回默认结果。
+        storedemo::ReadChunkResponse ReadChunk(const storedemo::ReadChunkRequest&) override
+        {
+            return {};
+        }
+
+        // Pull 测试不使用删除接口，返回默认结果。
+        storedemo::DeleteChunkResponse DeleteChunk(const storedemo::DeleteChunkRequest&) override
+        {
+            return {};
+        }
+
+        // Pull 测试不使用 stat 接口，返回默认结果。
+        storedemo::StatChunkResponse StatChunk(const storedemo::StatChunkRequest&) override
+        {
+            return {};
+        }
+
+        // Pull 测试不使用 list 接口，返回默认结果。
+        storedemo::ListChunksResponse ListChunks(const storedemo::ListChunksRequest&) override
+        {
+            return {};
+        }
+
+        // 设置下一次 WriteChunk 返回的响应。
+        void set_response(storedemo::WriteChunkResponse response)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            response_ = std::move(response);
+        }
+
+        // 返回 WriteChunk 调用次数。
+        std::size_t write_calls() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return write_calls_;
+        }
+
+        // 返回最近一次 WriteChunk 收到的请求。
+        storedemo::WriteChunkRequest last_request() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return last_request_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        std::shared_ptr<std::vector<std::string>> order_;
+        storedemo::WriteChunkResponse response_;
+        storedemo::WriteChunkRequest last_request_;
+        std::size_t write_calls_ = 0;
+    };
+
+    // READ 后端测试替身：真实 malloc 目标区（不注册），捕获请求与完成回调供测试手动驱动。
+    class FakeStorageRdmaReadBackend final : public storedemo::StorageRdmaReadBackend
+    {
+    public:
+        // 分配目标区；可通过 SetCreateFailure 配置失败路径。
+        std::unique_ptr<rdma::RdmaMemoryRegion> CreateTargetRegion(std::size_t size,
+                                                                   std::string* error) override
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++create_calls_;
+            if (!create_ok_)
+            {
+                if (error != nullptr)
+                {
+                    *error = create_error_;
+                }
+                return nullptr;
+            }
+            return rdma::RdmaMemoryRegion::Allocate(size, error);
+        }
+
+        // 捕获 READ 请求与完成回调后立即返回；可通过 SetSubmitFailure 配置失败路径。
+        bool SubmitRead(rdma::RdmaMemoryRegion& target,
+                        const raft::rdma::PullRequest& request,
+                        ReadCompletion completion,
+                        std::string* error) override
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++submit_calls_;
+                target_ = &target;
+                request_ = request;
+                completion_ = std::move(completion);
+                if (!submit_ok_)
+                {
+                    if (error != nullptr)
+                    {
+                        *error = submit_error_;
+                    }
+                }
+                else if (error != nullptr)
+                {
+                    error->clear();
+                }
+            }
+            cv_.notify_all();
+            return submit_ok_;
+        }
+
+        // 等待至少一次 SubmitRead 被调用。
+        bool WaitForSubmission(std::chrono::milliseconds timeout)
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            return cv_.wait_for(lock, timeout, [this] { return submit_calls_ > 0; });
+        }
+
+        // 配置 CreateTargetRegion 返回失败及错误文本。
+        void SetCreateFailure(std::string error)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            create_ok_ = false;
+            create_error_ = std::move(error);
+        }
+
+        // 配置 SubmitRead 返回失败及错误文本。
+        void SetSubmitFailure(std::string error)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            submit_ok_ = false;
+            submit_error_ = std::move(error);
+        }
+
+        // 模拟 READ 把字节写入目标区。
+        void SetTargetBytes(const std::string& payload)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (target_ != nullptr && target_->data() != nullptr)
+            {
+                std::memcpy(target_->data(), payload.data(), payload.size());
+            }
+        }
+
+        // 触发 READ 完成回调；可重复调用以验证 service 的恰好一次保护。
+        void CompleteRead(bool ok, std::string error = {})
+        {
+            ReadCompletion completion;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                completion = completion_;
+            }
+            if (completion)
+            {
+                completion(ok, std::move(error));
+            }
+        }
+
+        // 返回 CreateTargetRegion 调用次数。
+        int create_calls() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return create_calls_;
+        }
+
+        // 返回 SubmitRead 调用次数。
+        int submit_calls() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return submit_calls_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        std::condition_variable cv_;
+        bool create_ok_ = true;
+        std::string create_error_;
+        bool submit_ok_ = true;
+        std::string submit_error_;
+        int create_calls_ = 0;
+        int submit_calls_ = 0;
+        rdma::RdmaMemoryRegion* target_ = nullptr;
+        raft::rdma::PullRequest request_;
+        ReadCompletion completion_;
+    };
+
+    // Pull 测试夹具：组装 service + 替身，统一维护顺序日志与合法请求。
+    struct PullServiceFixture
+    {
+        explicit PullServiceFixture(storedemo::BoundedStorageExecutor* executor = nullptr)
+            : service(std::make_shared<storedemo::StorageRdmaService>(store, &backend, executor))
+        {
+            request.set_chunk_id(MakeValidPullChunkId());
+        }
+
+        // 设置 length / remote_address / remote_rkey / checksum 描述符。
+        void SetPayloadDescriptor(const std::string& payload)
+        {
+            request.set_length(payload.size());
+            request.set_remote_address(0x00007F0000100000ULL);
+            request.set_remote_rkey(0x1234);
+            *request.mutable_checksum() = MakePullChecksum(payload);
+        }
+
+        std::shared_ptr<std::vector<std::string>> order = std::make_shared<std::vector<std::string>>();
+        std::shared_ptr<RecordingChunkStore> store = std::make_shared<RecordingChunkStore>(order);
+        FakeStorageRdmaReadBackend backend;
+        TestRpcController controller;
+        raft::rdma::PullRequest request;
+        raft::rdma::PullResponse response;
+        OrderingClosure done{order};
+        std::shared_ptr<storedemo::StorageRdmaService> service;
+    };
+
+    TEST(RdmaTransportContractTest, PullServiceSubmitsReadAndReturnsBeforeCompletion)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "hello-pull-chunk";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        EXPECT_EQ(fixture.done.runs(), 0);
+        EXPECT_EQ(fixture.store->write_calls(), 0u);
+        EXPECT_FALSE(fixture.controller.Failed());
+
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_TRUE(fixture.response.ok());
+        EXPECT_TRUE(fixture.response.durable());
+        EXPECT_EQ(fixture.response.chunk_id(), fixture.request.chunk_id());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceForwardsIdentityChecksumAndPayloadToChunkStore)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "chunk-bytes-0123456789";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        ASSERT_EQ(fixture.store->write_calls(), 1u);
+        const storedemo::WriteChunkRequest recorded = fixture.store->last_request();
+        EXPECT_FALSE(recorded.request_id.empty());
+        EXPECT_EQ(recorded.identity.chunk_id, fixture.request.chunk_id());
+        EXPECT_FALSE(recorded.identity.object_id.empty());
+        EXPECT_EQ(recorded.identity.version, 7u);
+        EXPECT_EQ(recorded.identity.chunk_index, 0u);
+        EXPECT_EQ(recorded.identity.offset, 0u);
+        ASSERT_TRUE(recorded.expected_size.has_value());
+        EXPECT_EQ(*recorded.expected_size, payload.size());
+        EXPECT_EQ(recorded.expected_checksum.algorithm, storedemo::ChunkChecksumAlgorithm::kSha256);
+        EXPECT_EQ(recorded.expected_checksum.value, MakePullChecksum(payload).value());
+        EXPECT_EQ(recorded.payload, payload);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        ASSERT_EQ(fixture.order->size(), 2u);
+        EXPECT_EQ((*fixture.order)[0], "store");
+        EXPECT_EQ((*fixture.order)[1], "ack");
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceReadFailureSkipsStoreAndFails)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "read-failure-chunk";
+        fixture.SetPayloadDescriptor(payload);
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+
+        fixture.backend.CompleteRead(false, "simulated READ failure");
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_EQ(fixture.store->write_calls(), 0u);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "simulated READ failure");
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_FALSE(fixture.response.durable());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceStoreFailureDoesNotReturnDurableAck)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "store-failure-chunk";
+        fixture.SetPayloadDescriptor(payload);
+
+        storedemo::WriteChunkResponse failure;
+        failure.status = storedemo::StorageNodeStatusCode::kIoError;
+        failure.error_detail = "disk full";
+        failure.durable = false;
+        fixture.store->set_response(failure);
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "disk full");
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_FALSE(fixture.response.durable());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceChecksumMismatchIsReportedAsFailure)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "checksum-mismatch-chunk";
+        fixture.SetPayloadDescriptor(payload);
+
+        storedemo::WriteChunkResponse mismatch;
+        mismatch.status = storedemo::StorageNodeStatusCode::kChecksumMismatch;
+        mismatch.error_detail = "chunk checksum mismatch";
+        mismatch.durable = false;
+        fixture.store->set_response(mismatch);
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        fixture.backend.SetTargetBytes("corrupted-bytes");
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "chunk checksum mismatch");
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_FALSE(fixture.response.durable());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceIdempotentDuplicateReturnsDurableAlreadyExists)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "duplicate-chunk-bytes";
+        fixture.SetPayloadDescriptor(payload);
+
+        storedemo::WriteChunkResponse duplicate;
+        duplicate.status = storedemo::StorageNodeStatusCode::kOk;
+        duplicate.durable = true;
+        duplicate.already_exists = true;
+        duplicate.metadata.identity.chunk_id = fixture.request.chunk_id();
+        fixture.store->set_response(duplicate);
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_TRUE(fixture.response.ok());
+        EXPECT_TRUE(fixture.response.durable());
+        EXPECT_TRUE(fixture.response.already_exists());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceConflictDoesNotReturnSuccess)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "conflicting-chunk-bytes";
+        fixture.SetPayloadDescriptor(payload);
+
+        storedemo::WriteChunkResponse conflict;
+        conflict.status = storedemo::StorageNodeStatusCode::kConflict;
+        conflict.error_detail = "chunk identity conflicts with existing content";
+        conflict.durable = false;
+        fixture.store->set_response(conflict);
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_FALSE(fixture.response.durable());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceDuplicateReadCompletionRunsOnce)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "double-completion-chunk";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        fixture.backend.SetTargetBytes(payload);
+
+        fixture.backend.CompleteRead(true);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_FALSE(fixture.controller.Failed());
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceMissingBackendFailsExplicitly)
+    {
+        std::shared_ptr<RecordingChunkStore> store =
+            std::make_shared<RecordingChunkStore>(std::make_shared<std::vector<std::string>>());
+        storedemo::StorageRdmaService service(store, nullptr);
+
+        TestRpcController controller;
+        raft::rdma::PullRequest request;
+        request.set_chunk_id(MakeValidPullChunkId());
+        request.set_length(1);
+        request.set_remote_address(0x1000);
+        request.set_remote_rkey(1);
+        *request.mutable_checksum() = MakePullChecksum("x");
+        raft::rdma::PullResponse response;
+        CountingClosure done;
+
+        service.Pull(&controller, &request, &response, &done);
+
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(controller.Failed());
+        EXPECT_NE(controller.ErrorText().find("backend"), std::string::npos);
+        EXPECT_EQ(store->write_calls(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceTargetRegionFailureFailsBeforeRead)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "no-region-chunk";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.backend.SetCreateFailure("no registered protection domain");
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "no registered protection domain");
+        EXPECT_EQ(fixture.backend.submit_calls(), 0);
+        EXPECT_EQ(fixture.store->write_calls(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceSubmitFailureFailsBeforeStore)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "submit-failure-chunk";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.backend.SetSubmitFailure("ibv_post_send failed");
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+
+        EXPECT_EQ(fixture.done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "ibv_post_send failed");
+        EXPECT_EQ(fixture.store->write_calls(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceRejectsInvalidRequestBeforeRead)
+    {
+        const auto expect_rejected = [](const std::function<void(raft::rdma::PullRequest&)>& mutate)
+        {
+            PullServiceFixture fixture;
+            const std::string payload = "x";
+            fixture.SetPayloadDescriptor(payload);
+            mutate(fixture.request);
+
+            fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+
+            EXPECT_EQ(fixture.done.runs(), 1);
+            EXPECT_TRUE(fixture.controller.Failed());
+            EXPECT_EQ(fixture.backend.submit_calls(), 0);
+            EXPECT_EQ(fixture.store->write_calls(), 0u);
+        };
+
+        expect_rejected([](raft::rdma::PullRequest& request) { request.set_chunk_id(""); });
+        expect_rejected([](raft::rdma::PullRequest& request) { request.set_length(0); });
+        expect_rejected([](raft::rdma::PullRequest& request)
+                        { request.set_length(storedemo::kProductionChunkSizeBytes + 1); });
+        expect_rejected([](raft::rdma::PullRequest& request) { request.set_remote_address(0); });
+        expect_rejected([](raft::rdma::PullRequest& request) { request.set_remote_rkey(0); });
+        expect_rejected([](raft::rdma::PullRequest& request)
+                        {
+                            request.set_remote_address(std::numeric_limits<std::uint64_t>::max());
+                            request.set_length(2);
+                        });
+        expect_rejected([](raft::rdma::PullRequest& request) { request.clear_checksum(); });
+        expect_rejected([](raft::rdma::PullRequest& request) { request.mutable_checksum()->set_value(""); });
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceAcceptsMaximumChunkSizeBoundary)
+    {
+        PullServiceFixture fixture;
+        fixture.request.set_chunk_id(MakeValidPullChunkId());
+        fixture.request.set_length(storedemo::kProductionChunkSizeBytes);
+        fixture.request.set_remote_address(0x1000);
+        fixture.request.set_remote_rkey(1);
+        fixture.request.mutable_checksum()->set_algorithm(raft::rdma::RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256);
+        fixture.request.mutable_checksum()->set_value(std::string(64, 'a'));
+        fixture.request.mutable_checksum()->set_size_bytes(storedemo::kProductionChunkSizeBytes);
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+
+        EXPECT_EQ(fixture.done.runs(), 0);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+
+        fixture.backend.CompleteRead(false, "test-stop");
+        EXPECT_EQ(fixture.done.runs(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceRunsStorePhaseOnBoundedExecutor)
+    {
+        storedemo::BoundedStorageExecutor executor({2, 16});
+        PullServiceFixture fixture(&executor);
+        const std::string payload = "executor-payload";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        fixture.service->Pull(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        ASSERT_TRUE(fixture.done.WaitForRuns(1, kAsyncTimeout));
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_TRUE(fixture.response.durable());
+
+        const storedemo::StorageExecutorShutdownResult shutdown = executor.Shutdown();
+        EXPECT_TRUE(shutdown.stopped);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceEndToEndThroughRdmaServerCompletesAfterStoreWrite)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "end-to-end-pull";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        InProcessServer server(fixture.service.get());
+        InProcessConnection connection;
+        connection.set_server(&server);
+        server.set_client(&connection);
+
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        WaitingClosure done;
+
+        stub.Pull(&fixture.controller, &fixture.request, &fixture.response, &done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+        EXPECT_EQ(done.runs(), 0);
+        EXPECT_EQ(fixture.store->write_calls(), 0u);
+        EXPECT_EQ(server.responses(), 0);
+
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        ASSERT_TRUE(done.WaitForRuns(1, kAsyncTimeout));
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_TRUE(fixture.response.ok());
+        EXPECT_TRUE(fixture.response.durable());
+        EXPECT_EQ(server.responses(), 1);
+        EXPECT_EQ(server.pending_request_count(), 0u);
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceClientCloseDuringReadDropsLateAck)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "client-close-pull";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        InProcessServer server(fixture.service.get());
+        InProcessConnection connection;
+        connection.set_server(&server);
+        server.set_client(&connection);
+
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+        WaitingClosure done;
+
+        stub.Pull(&fixture.controller, &fixture.request, &fixture.response, &done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+
+        connection.Close();
+        EXPECT_EQ(done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_EQ(server.responses(), 1);
+        EXPECT_EQ(done.runs(), 1);
+        EXPECT_EQ(server.pending_request_count(), 0u);
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullServiceServerTransportFailureSkipsAckButFinishesContext)
+    {
+        PullServiceFixture fixture;
+        const std::string payload = "server-failure-pull";
+        fixture.SetPayloadDescriptor(payload);
+        fixture.store->set_response(MakeDurableWriteResponse(fixture.request.chunk_id()));
+
+        InProcessServer server(fixture.service.get());
+        WaitingClosure done;
+        InProcessConnection connection;
+        connection.set_server(&server);
+        server.set_client(&connection);
+
+        raft::rdma::RdmaControlService::Stub stub(&connection);
+
+        stub.Pull(&fixture.controller, &fixture.request, &fixture.response, &done);
+        ASSERT_TRUE(fixture.backend.WaitForSubmission(kAsyncTimeout));
+
+        server.OnTransportFailure("client link down");
+
+        fixture.backend.SetTargetBytes(payload);
+        fixture.backend.CompleteRead(true);
+
+        EXPECT_EQ(fixture.store->write_calls(), 1u);
+        EXPECT_EQ(server.responses(), 0);
+        EXPECT_EQ(server.pending_request_count(), 0u);
+        EXPECT_EQ(done.runs(), 0);
+
+        connection.Close();
+        EXPECT_EQ(done.runs(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(connection.pending_rpc_count(), 0u);
+    }
+
+#endif
 
 #endif
 }

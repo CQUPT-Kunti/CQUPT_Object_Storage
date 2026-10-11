@@ -1073,13 +1073,22 @@ add_raft_gtest(cluster_config_test
 # (unavailable backend vs Linux librdmacm + libibverbs backend)
 # =========================
 if (TARGET rdma_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rdma_transport_contract_test.cpp")
+  set(RDMA_TRANSPORT_CONTRACT_EXTRA_SOURCES)
+  if (EXISTS "${CMAKE_SOURCE_DIR}/modules/store/node/storage_rdma_service.cpp")
+    list(APPEND RDMA_TRANSPORT_CONTRACT_EXTRA_SOURCES
+      ${CMAKE_SOURCE_DIR}/modules/store/node/storage_rdma_service.cpp
+    )
+  endif()
+
   add_executable(rdma_transport_contract_test
     rdma_transport_contract_test.cpp
+    ${RDMA_TRANSPORT_CONTRACT_EXTRA_SOURCES}
   )
 
   target_link_libraries(rdma_transport_contract_test
     PRIVATE
       rdma_core
+      raft_core
       GTest::gtest_main
   )
 
