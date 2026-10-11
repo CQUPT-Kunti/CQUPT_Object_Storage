@@ -34,6 +34,19 @@
 #include "rdma/rdma_server.h"
 #define CQUPT_RDMA_CONTRACT_HAS_SERVER 1
 #endif
+#if __has_include("rdma/rdma_memory_region.h")
+#include "rdma/rdma_memory_region.h"
+#define CQUPT_RDMA_CONTRACT_HAS_MEMORY_REGION 1
+#endif
+#endif
+
+#if defined(CQUPT_RDMA_ENABLED) && CQUPT_RDMA_ENABLED
+#if defined(__has_include)
+#if __has_include(<infiniband/verbs.h>)
+#include <infiniband/verbs.h>
+#define CQUPT_RDMA_CONTRACT_HAS_VERBS 1
+#endif
+#endif
 #endif
 
 #if defined(CQUPT_RDMA_CONTRACT_HAS_CONNECTION) && defined(CQUPT_RDMA_CONTRACT_HAS_SERVER)
@@ -381,17 +394,130 @@ namespace
         EXPECT_FALSE(parsed_length.ParseFromArray(malformed_length, sizeof(malformed_length)));
     }
 
-    TEST(RdmaTransportContractTest, RdmaControlServiceDescriptorExposesSingleProbeMethod)
+    TEST(RdmaTransportContractTest, RdmaControlServiceDescriptorExposesProbeAndPullMethods)
     {
         const google::protobuf::ServiceDescriptor* descriptor = raft::rdma::RdmaControlService::descriptor();
 
         ASSERT_NE(descriptor, nullptr);
         EXPECT_EQ(descriptor->name(), "RdmaControlService");
-        EXPECT_EQ(descriptor->method_count(), 1);
+        EXPECT_EQ(descriptor->method_count(), 2);
         EXPECT_EQ(descriptor->method(0)->name(), "Probe");
         EXPECT_EQ(descriptor->method(0)->input_type()->name(), "ProbeRequest");
         EXPECT_EQ(descriptor->method(0)->output_type()->name(), "ProbeResponse");
+
+        const google::protobuf::MethodDescriptor* pull = descriptor->FindMethodByName("Pull");
+        ASSERT_NE(pull, nullptr);
+        EXPECT_EQ(pull->input_type()->name(), "PullRequest");
+        EXPECT_EQ(pull->output_type()->name(), "PullResponse");
         EXPECT_EQ(descriptor->FindMethodByName("Missing"), nullptr);
+    }
+
+    class PullRecordingService final : public raft::rdma::RdmaControlService
+    {
+    public:
+        void Pull(google::protobuf::RpcController*,
+                  const raft::rdma::PullRequest* request,
+                  raft::rdma::PullResponse* response,
+                  google::protobuf::Closure* done) override
+        {
+            ++calls_;
+            response->set_ok(true);
+            response->set_durable(true);
+            response->set_chunk_id(request->chunk_id());
+            if (done != nullptr)
+            {
+                done->Run();
+            }
+        }
+
+        int calls() const
+        {
+            return calls_;
+        }
+
+    private:
+        int calls_ = 0;
+    };
+
+    TEST(RdmaTransportContractTest, GeneratedServiceDispatchInvokesPull)
+    {
+        PullRecordingService service;
+        TestRpcController controller;
+        raft::rdma::PullRequest request;
+        request.set_chunk_id("chunk-pull");
+        raft::rdma::PullResponse response;
+        CountingClosure done;
+
+        const google::protobuf::MethodDescriptor* method =
+            raft::rdma::RdmaControlService::descriptor()->FindMethodByName("Pull");
+        ASSERT_NE(method, nullptr);
+
+        service.CallMethod(method, &controller, &request, &response, &done);
+
+        EXPECT_EQ(service.calls(), 1);
+        EXPECT_EQ(done.runs.load(), 1);
+        EXPECT_TRUE(response.ok());
+        EXPECT_TRUE(response.durable());
+        EXPECT_EQ(response.chunk_id(), "chunk-pull");
+        EXPECT_FALSE(controller.Failed());
+    }
+
+    TEST(RdmaTransportContractTest, GeneratedStubDispatchesPullThroughRpcChannel)
+    {
+        FakeRpcChannel channel;
+        raft::rdma::RdmaControlService::Stub stub(&channel);
+        TestRpcController controller;
+        raft::rdma::PullRequest request;
+        request.set_chunk_id("chunk-dispatch");
+        request.set_remote_rkey(7);
+        raft::rdma::PullResponse response;
+        CountingClosure done;
+
+        stub.Pull(&controller, &request, &response, &done);
+
+        ASSERT_NE(channel.method(), nullptr);
+        EXPECT_EQ(channel.method()->full_name(), "raft.rdma.RdmaControlService.Pull");
+        EXPECT_EQ(channel.call_count(), 1);
+        EXPECT_EQ(done.runs.load(), 0);
+
+        const auto* captured = dynamic_cast<const raft::rdma::PullRequest*>(channel.request());
+        ASSERT_NE(captured, nullptr);
+        EXPECT_EQ(captured->chunk_id(), "chunk-dispatch");
+        EXPECT_EQ(captured->remote_rkey(), 7u);
+    }
+
+    TEST(RdmaTransportContractTest, PullResponseExpressesDurableSuccessAndFailure)
+    {
+        raft::rdma::PullResponse success;
+        success.set_ok(true);
+        success.set_durable(true);
+        success.set_already_exists(false);
+        success.set_chunk_id("chunk-a");
+
+        std::string success_bytes;
+        ASSERT_TRUE(success.SerializeToString(&success_bytes));
+
+        raft::rdma::PullResponse parsed_success;
+        ASSERT_TRUE(parsed_success.ParseFromString(success_bytes));
+        EXPECT_TRUE(parsed_success.ok());
+        EXPECT_TRUE(parsed_success.durable());
+        EXPECT_FALSE(parsed_success.already_exists());
+        EXPECT_EQ(parsed_success.chunk_id(), "chunk-a");
+        EXPECT_TRUE(parsed_success.error_detail().empty());
+
+        raft::rdma::PullResponse failure;
+        failure.set_ok(false);
+        failure.set_durable(false);
+        failure.set_error_detail("checksum mismatch");
+
+        std::string failure_bytes;
+        ASSERT_TRUE(failure.SerializeToString(&failure_bytes));
+
+        raft::rdma::PullResponse parsed_failure;
+        ASSERT_TRUE(parsed_failure.ParseFromString(failure_bytes));
+        EXPECT_FALSE(parsed_failure.ok());
+        EXPECT_FALSE(parsed_failure.durable());
+        EXPECT_EQ(parsed_failure.error_detail(), "checksum mismatch");
     }
 
     TEST(RdmaTransportContractTest, GeneratedServiceDispatchInvokesProbeAndRunsClosureOnce)
@@ -1291,6 +1417,193 @@ namespace
         EXPECT_TRUE(controller.Failed());
         EXPECT_FALSE(controller.ErrorText().empty());
         EXPECT_EQ(response.probe_id(), 0u);
+    }
+
+#endif
+
+#endif
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_MEMORY_REGION)
+
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionAllocateRejectsZeroSize)
+    {
+        std::string error;
+        const std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(0, &error);
+
+        EXPECT_EQ(region, nullptr);
+        EXPECT_FALSE(error.empty());
+    }
+
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionOwnsBufferUntilRelease)
+    {
+        std::string error;
+        std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(4096, &error);
+        ASSERT_NE(region, nullptr) << error;
+
+        EXPECT_NE(region->data(), nullptr);
+        EXPECT_EQ(region->size(), 4096u);
+        EXPECT_EQ(region->lkey(), 0u);
+        EXPECT_EQ(region->rkey(), 0u);
+        EXPECT_EQ(region->native_handle(), nullptr);
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kAllocated);
+
+        ASSERT_TRUE(region->Release(&error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+        EXPECT_EQ(region->data(), nullptr);
+        EXPECT_EQ(region->size(), 0u);
+
+        EXPECT_TRUE(region->Release(&error));
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionRegisterWithoutProtectionDomainFailsWithoutLeak)
+    {
+        std::string error;
+        std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(1024, &error);
+        ASSERT_NE(region, nullptr) << error;
+
+        EXPECT_FALSE(region->Register(nullptr, 0x1, &error));
+        EXPECT_FALSE(error.empty());
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kAllocated);
+        EXPECT_NE(region->data(), nullptr);
+        EXPECT_EQ(region->size(), 1024u);
+
+        error.clear();
+        ASSERT_TRUE(region->Release(&error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionDeregisterAndReleaseAreIdempotent)
+    {
+        std::string error;
+        std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(256, &error);
+        ASSERT_NE(region, nullptr) << error;
+
+        EXPECT_TRUE(region->Deregister(&error));
+        EXPECT_TRUE(region->Deregister(&error));
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kDeregistered);
+
+        EXPECT_TRUE(region->Release(&error));
+        EXPECT_TRUE(region->Release(&error));
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+    }
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_VERBS)
+
+    class IbvProtectionDomainScope
+    {
+    public:
+        bool Open(std::string* error)
+        {
+            int device_count = 0;
+            devices_ = ibv_get_device_list(&device_count);
+            if (devices_ == nullptr || device_count <= 0)
+            {
+                if (error != nullptr)
+                {
+                    *error = "no RDMA device is available in this environment";
+                }
+                return false;
+            }
+
+            context_ = ibv_open_device(devices_[0]);
+            if (context_ == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = "ibv_open_device failed for the first RDMA device";
+                }
+                return false;
+            }
+
+            pd_ = ibv_alloc_pd(context_);
+            if (pd_ == nullptr)
+            {
+                if (error != nullptr)
+                {
+                    *error = "ibv_alloc_pd failed";
+                }
+                return false;
+            }
+            return true;
+        }
+
+        ~IbvProtectionDomainScope()
+        {
+            if (pd_ != nullptr)
+            {
+                ibv_dealloc_pd(pd_);
+            }
+            if (context_ != nullptr)
+            {
+                ibv_close_device(context_);
+            }
+            if (devices_ != nullptr)
+            {
+                ibv_free_device_list(devices_);
+            }
+        }
+
+        ibv_pd* pd() const
+        {
+            return pd_;
+        }
+
+    private:
+        ibv_device** devices_ = nullptr;
+        ibv_context* context_ = nullptr;
+        ibv_pd* pd_ = nullptr;
+    };
+
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionRegistersWithLocalWriteAccess)
+    {
+        IbvProtectionDomainScope scope;
+        std::string error;
+        if (!scope.Open(&error))
+        {
+            GTEST_SKIP() << error;
+        }
+
+        std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(4096, &error);
+        ASSERT_NE(region, nullptr) << error;
+
+        ASSERT_TRUE(region->Register(scope.pd(), IBV_ACCESS_LOCAL_WRITE, &error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kRegistered);
+        EXPECT_NE(region->native_handle(), nullptr);
+        EXPECT_NE(region->lkey(), 0u);
+        EXPECT_NE(region->rkey(), 0u);
+        EXPECT_NE(region->data(), nullptr);
+        EXPECT_EQ(region->size(), 4096u);
+
+        ASSERT_TRUE(region->Deregister(&error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kDeregistered);
+        EXPECT_EQ(region->lkey(), 0u);
+        EXPECT_EQ(region->rkey(), 0u);
+        EXPECT_EQ(region->native_handle(), nullptr);
+
+        ASSERT_TRUE(region->Release(&error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+    }
+
+    TEST(RdmaTransportContractTest, RdmaMemoryRegionRegistersWithRemoteReadAccessForPullSource)
+    {
+        IbvProtectionDomainScope scope;
+        std::string error;
+        if (!scope.Open(&error))
+        {
+            GTEST_SKIP() << error;
+        }
+
+        std::unique_ptr<rdma::RdmaMemoryRegion> region = rdma::RdmaMemoryRegion::Allocate(8192, &error);
+        ASSERT_NE(region, nullptr) << error;
+
+        ASSERT_TRUE(region->Register(scope.pd(), IBV_ACCESS_REMOTE_READ, &error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kRegistered);
+        EXPECT_NE(region->rkey(), 0u);
+
+        ASSERT_TRUE(region->Release(&error)) << error;
+        EXPECT_EQ(region->state(), rdma::RdmaMemoryRegionState::kReleased);
+        EXPECT_TRUE(region->Release(&error));
     }
 
 #endif
@@ -2306,11 +2619,34 @@ namespace
                         "before the READ completion is delivered";
     }
 
-    TEST(RdmaTransportContractTest, PullControlMessageSeparatesDescriptorFromChunkPayloadAwaitsT009)
+    TEST(RdmaTransportContractTest, PullControlMessageSeparatesDescriptorFromChunkPayload)
     {
-        GTEST_SKIP() << "requires T009 pull descriptor/control messages in proto/rdma.proto: "
-                        "the control request may carry identity, length, checksum, address, and rkey, "
-                        "but chunk bytes must never be embedded in the Protobuf request";
+        raft::rdma::PullRequest request;
+        request.set_chunk_id("object-1~7~0");
+        request.set_offset(0);
+        request.set_length(128ULL * 1024ULL * 1024ULL);
+        request.set_remote_address(0x00007F0012345000ULL);
+        request.set_remote_rkey(0x00ABCDEFu);
+        request.set_descriptor_generation(42);
+        request.mutable_checksum()->set_algorithm(raft::rdma::RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256);
+        request.mutable_checksum()->set_value(std::string(64, 'a'));
+        request.mutable_checksum()->set_size_bytes(128ULL * 1024ULL * 1024ULL);
+
+        std::string bytes;
+        ASSERT_TRUE(request.SerializeToString(&bytes));
+        EXPECT_LT(bytes.size(), 512u);
+
+        raft::rdma::PullRequest parsed;
+        ASSERT_TRUE(parsed.ParseFromString(bytes));
+        EXPECT_EQ(parsed.chunk_id(), "object-1~7~0");
+        EXPECT_EQ(parsed.offset(), 0u);
+        EXPECT_EQ(parsed.length(), 128ULL * 1024ULL * 1024ULL);
+        EXPECT_EQ(parsed.remote_address(), 0x00007F0012345000ULL);
+        EXPECT_EQ(parsed.remote_rkey(), 0x00ABCDEFu);
+        EXPECT_EQ(parsed.descriptor_generation(), 42u);
+        EXPECT_EQ(parsed.checksum().algorithm(), raft::rdma::RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256);
+        EXPECT_EQ(parsed.checksum().value().size(), 64u);
+        EXPECT_EQ(parsed.checksum().size_bytes(), 128ULL * 1024ULL * 1024ULL);
     }
 
     TEST(RdmaTransportContractTest, PullClientMemoryRegionLifetimeAwaitsT009)

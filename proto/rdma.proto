@@ -14,6 +14,36 @@ message ProbeResponse {
   string message = 3;
 }
 
+enum RdmaChunkChecksumAlgorithm {
+  RDMA_CHUNK_CHECKSUM_ALGORITHM_UNSPECIFIED = 0;
+  RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256 = 1;
+}
+
+message RdmaChunkChecksum {
+  RdmaChunkChecksumAlgorithm algorithm = 1;
+  string value = 2;
+  uint64 size_bytes = 3;
+}
+
+message PullRequest {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  RdmaChunkChecksum checksum = 4;
+  uint64 remote_address = 5;
+  uint32 remote_rkey = 6;
+  uint64 descriptor_generation = 7;
+}
+
+message PullResponse {
+  bool ok = 1;
+  bool already_exists = 2;
+  bool durable = 3;
+  string chunk_id = 4;
+  string error_detail = 5;
+}
+
 service RdmaControlService {
   rpc Probe(ProbeRequest) returns (ProbeResponse);
+  rpc Pull(PullRequest) returns (PullResponse);
 }
