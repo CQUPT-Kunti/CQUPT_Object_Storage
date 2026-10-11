@@ -26,7 +26,7 @@
 
 **Goal**: Server RDMA READs a client buffer and acknowledges only the existing durable store boundary.
 
-- [ ] T008 [US2] Extend `tests/rdma_transport_contract_test.cpp` with Pull cases for asynchronous READ completion, large payload separation, checksum mismatch, on-demand client/server MR lifetime and callback cleanup, disconnect cleanup, idempotent duplicate, and durable ACK ordering.
+- [X] T008 [US2] Extend `tests/rdma_transport_contract_test.cpp` with Pull cases for asynchronous READ completion, large payload separation, checksum mismatch, on-demand client/server MR lifetime and callback cleanup, disconnect cleanup, idempotent duplicate, and durable ACK ordering.
 - [ ] T009 [US2] Implement on-demand allocate/register/deregister/free ownership in `modules/rdma/rdma_memory_region.h/.cpp` with no generic pool/cache/reuse layer; add only the Pull descriptor/control messages needed to `proto/rdma_control.proto` and regenerate through existing CMake rules.
 - [ ] T010 [US2] Add `modules/store/node/storage_rdma_service.h/.cpp`, return from the Pull service method after posting READ, retain the server RPC/region context through READ completion and store use, then run the response closure after `ChunkStore::WriteChunk()` completes; keep identity, checksum, conflict, and durability decisions in the store layer.
 

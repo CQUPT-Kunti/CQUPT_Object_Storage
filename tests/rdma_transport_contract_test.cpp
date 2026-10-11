@@ -1868,6 +1868,501 @@ namespace
         EXPECT_EQ(done.runs.load(), 0);
     }
 
+    enum class PullStoreOutcome
+    {
+        kDurableSuccess,
+        kAlreadyExists,
+        kConflict,
+        kChecksumMismatch,
+        kIoError,
+    };
+
+    class PullSimulationStore
+    {
+    public:
+        void set_outcome(PullStoreOutcome outcome)
+        {
+            outcome_ = outcome;
+        }
+
+        PullStoreOutcome outcome() const
+        {
+            return outcome_;
+        }
+
+        void BeginWrite()
+        {
+            ++write_calls_;
+            write_in_progress_ = true;
+        }
+
+        void FinishWrite()
+        {
+            write_in_progress_ = false;
+            ++completed_writes_;
+        }
+
+        std::size_t write_calls() const
+        {
+            return write_calls_;
+        }
+
+        std::size_t completed_writes() const
+        {
+            return completed_writes_;
+        }
+
+        bool write_in_progress() const
+        {
+            return write_in_progress_;
+        }
+
+    private:
+        PullStoreOutcome outcome_ = PullStoreOutcome::kDurableSuccess;
+        std::size_t write_calls_ = 0;
+        std::size_t completed_writes_ = 0;
+        bool write_in_progress_ = false;
+    };
+
+    class PullSimulationService final : public raft::rdma::RdmaControlService
+    {
+    public:
+        explicit PullSimulationService(PullSimulationStore& store)
+            : store_(store)
+        {
+        }
+
+        void Probe(google::protobuf::RpcController* controller,
+                   const raft::rdma::ProbeRequest* request,
+                   raft::rdma::ProbeResponse* response,
+                   google::protobuf::Closure* done) override
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            controller_ = controller;
+            response_ = response;
+            done_ = done;
+            identity_ = request->probe_id();
+            read_posted_ = true;
+            read_completed_ = false;
+            cv_.notify_all();
+        }
+
+        bool WaitForReadPosted(std::chrono::milliseconds timeout)
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            return cv_.wait_for(lock, timeout, [this] { return read_posted_; });
+        }
+
+        void SimulateReadCompletion()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            read_completed_ = true;
+        }
+
+        bool read_completed() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return read_completed_;
+        }
+
+        bool store_pending() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return store_pending_;
+        }
+
+        bool BeginStoreWrite()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!read_completed_ || store_pending_)
+            {
+                return false;
+            }
+            store_.BeginWrite();
+            store_pending_ = true;
+            cv_.notify_all();
+            return true;
+        }
+
+        bool FinishStoreWrite()
+        {
+            google::protobuf::RpcController* controller = nullptr;
+            raft::rdma::ProbeResponse* response = nullptr;
+            google::protobuf::Closure* done = nullptr;
+            std::uint64_t identity = 0;
+            PullStoreOutcome outcome = PullStoreOutcome::kDurableSuccess;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!store_pending_)
+                {
+                    return false;
+                }
+                controller = controller_;
+                response = response_;
+                done = done_;
+                identity = identity_;
+                outcome = store_.outcome();
+                store_.FinishWrite();
+                store_pending_ = false;
+            }
+
+            switch (outcome)
+            {
+            case PullStoreOutcome::kDurableSuccess:
+            case PullStoreOutcome::kAlreadyExists:
+                response->set_probe_id(identity);
+                response->set_ok(true);
+                response->set_message(outcome == PullStoreOutcome::kAlreadyExists ? "durable-already-exists"
+                                                                                  : "durable-success");
+                break;
+            case PullStoreOutcome::kConflict:
+                controller->SetFailed("chunk store conflict");
+                break;
+            case PullStoreOutcome::kChecksumMismatch:
+                controller->SetFailed("chunk checksum mismatch");
+                break;
+            case PullStoreOutcome::kIoError:
+                controller->SetFailed("chunk store io error");
+                break;
+            }
+
+            if (done != nullptr)
+            {
+                done->Run();
+            }
+            return true;
+        }
+
+    private:
+        PullSimulationStore& store_;
+        mutable std::mutex mutex_;
+        std::condition_variable cv_;
+        google::protobuf::RpcController* controller_ = nullptr;
+        raft::rdma::ProbeResponse* response_ = nullptr;
+        google::protobuf::Closure* done_ = nullptr;
+        std::uint64_t identity_ = 0;
+        bool read_posted_ = false;
+        bool read_completed_ = false;
+        bool store_pending_ = false;
+    };
+
+    struct PullSimulationFixture
+    {
+        PullSimulationStore store;
+        PullSimulationService service{store};
+        TestRpcController controller;
+        raft::rdma::ProbeRequest request;
+        raft::rdma::ProbeResponse response;
+        CountingClosure done;
+        InProcessServer server{&service};
+        InProcessConnection connection;
+
+        void Wire()
+        {
+            connection.set_server(&server);
+            server.set_client(&connection);
+        }
+
+        void DrainPendingRead()
+        {
+            service.SimulateReadCompletion();
+            service.BeginStoreWrite();
+            service.FinishStoreWrite();
+        }
+    };
+
+    TEST(RdmaTransportContractTest, PullSimulationControlCallReturnsBeforeReadCompletion)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.request.set_probe_id(9001);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        EXPECT_FALSE(fixture.service.read_completed());
+        EXPECT_EQ(fixture.done.runs.load(), 0);
+        EXPECT_EQ(fixture.server.responses(), 0);
+        EXPECT_EQ(fixture.server.pending_request_count(), 1u);
+        EXPECT_EQ(fixture.connection.pending_rpc_count(), 1u);
+        EXPECT_FALSE(fixture.controller.Failed());
+
+        fixture.DrainPendingRead();
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationReadCompletionAloneDoesNotEmitDurableAck)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.request.set_probe_id(9002);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+
+        fixture.service.SimulateReadCompletion();
+
+        EXPECT_TRUE(fixture.service.read_completed());
+        EXPECT_EQ(fixture.store.write_calls(), 0u);
+        EXPECT_EQ(fixture.server.responses(), 0);
+        EXPECT_EQ(fixture.done.runs.load(), 0);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_FALSE(fixture.response.ok());
+
+        fixture.DrainPendingRead();
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationNoAckWhileStoreWriteIsInFlight)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.request.set_probe_id(9003);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+
+        EXPECT_TRUE(fixture.store.write_in_progress());
+        EXPECT_EQ(fixture.store.write_calls(), 1u);
+        EXPECT_EQ(fixture.store.completed_writes(), 0u);
+        EXPECT_EQ(fixture.server.responses(), 0);
+        EXPECT_EQ(fixture.done.runs.load(), 0);
+        EXPECT_FALSE(fixture.controller.Failed());
+
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationDurableAckFollowsStoreWriteSuccess)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.store.set_outcome(PullStoreOutcome::kDurableSuccess);
+        fixture.request.set_probe_id(9004);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.store.completed_writes(), 1u);
+        EXPECT_EQ(fixture.server.responses(), 1);
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.response.probe_id(), 9004u);
+        EXPECT_TRUE(fixture.response.ok());
+        EXPECT_EQ(fixture.response.message(), "durable-success");
+        EXPECT_EQ(fixture.server.pending_request_count(), 0u);
+        EXPECT_EQ(fixture.connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationStoreFailureDoesNotEmitDurableSuccess)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.store.set_outcome(PullStoreOutcome::kIoError);
+        fixture.request.set_probe_id(9005);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "chunk store io error");
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_EQ(fixture.server.responses(), 1);
+        EXPECT_EQ(fixture.server.pending_request_count(), 0u);
+        EXPECT_EQ(fixture.connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationChecksumMismatchFailsWithoutPublishingChunk)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.store.set_outcome(PullStoreOutcome::kChecksumMismatch);
+        fixture.request.set_probe_id(9006);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        EXPECT_TRUE(fixture.service.read_completed());
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "chunk checksum mismatch");
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_EQ(fixture.connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationIdempotentDuplicateMapsToDurableSuccess)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.store.set_outcome(PullStoreOutcome::kAlreadyExists);
+        fixture.request.set_probe_id(9007);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.store.write_calls(), 1u);
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_FALSE(fixture.controller.Failed());
+        EXPECT_TRUE(fixture.response.ok());
+        EXPECT_EQ(fixture.response.message(), "durable-already-exists");
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationConflictMapsToFailure)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.store.set_outcome(PullStoreOutcome::kConflict);
+        fixture.request.set_probe_id(9008);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.controller.ErrorText(), "chunk store conflict");
+        EXPECT_FALSE(fixture.response.ok());
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationClientCloseDuringReadDropsLateResponse)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.request.set_probe_id(9009);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+
+        fixture.connection.Close();
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.connection.pending_rpc_count(), 0u);
+
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.server.responses(), 1);
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_FALSE(fixture.response.ok());
+        EXPECT_EQ(fixture.server.pending_request_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullSimulationServerTransportFailureSkipsAckButReleasesContext)
+    {
+        PullSimulationFixture fixture;
+        fixture.Wire();
+        fixture.request.set_probe_id(9010);
+        raft::rdma::RdmaControlService::Stub stub(&fixture.connection);
+
+        stub.Probe(&fixture.controller, &fixture.request, &fixture.response, &fixture.done);
+        ASSERT_TRUE(fixture.service.WaitForReadPosted(kAsyncTimeout));
+        fixture.service.SimulateReadCompletion();
+        ASSERT_TRUE(fixture.service.BeginStoreWrite());
+
+        fixture.server.OnTransportFailure("connection lost during pull");
+        ASSERT_TRUE(fixture.service.FinishStoreWrite());
+
+        EXPECT_EQ(fixture.server.responses(), 0);
+        EXPECT_EQ(fixture.server.pending_request_count(), 0u);
+        EXPECT_EQ(fixture.done.runs.load(), 0);
+
+        fixture.connection.Close();
+        EXPECT_EQ(fixture.done.runs.load(), 1);
+        EXPECT_TRUE(fixture.controller.Failed());
+        EXPECT_EQ(fixture.connection.pending_rpc_count(), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, PullAsyncRdmaReadCompletionAwaitsT009T010)
+    {
+        GTEST_SKIP() << "requires T009 RdmaMemoryRegion and T010 StorageRdmaService: "
+                        "server must post an asynchronous RDMA READ and return from the Pull method "
+                        "before the READ completion is delivered";
+    }
+
+    TEST(RdmaTransportContractTest, PullControlMessageSeparatesDescriptorFromChunkPayloadAwaitsT009)
+    {
+        GTEST_SKIP() << "requires T009 pull descriptor/control messages in proto/rdma.proto: "
+                        "the control request may carry identity, length, checksum, address, and rkey, "
+                        "but chunk bytes must never be embedded in the Protobuf request";
+    }
+
+    TEST(RdmaTransportContractTest, PullClientMemoryRegionLifetimeAwaitsT009)
+    {
+        GTEST_SKIP() << "requires T009 RdmaMemoryRegion: the client region must stay registered until "
+                        "the final response proves the server READ finished, and a failed RPC alone "
+                        "must not allow early deregistration";
+    }
+
+    TEST(RdmaTransportContractTest, PullServerMemoryRegionLifetimeAwaitsT009T010)
+    {
+        GTEST_SKIP() << "requires T009 RdmaMemoryRegion and T010 StorageRdmaService: the server target "
+                        "region must stay registered through READ completion, checksum verification, "
+                        "and ChunkStore use, with exactly one deregister/free on the final path";
+    }
+
+    TEST(RdmaTransportContractTest, PullDisconnectBeforeReadPostedAwaitsT005T009T010)
+    {
+        GTEST_SKIP() << "requires T005 transport plus T009/T010: disconnecting before the READ is posted "
+                        "must release the pull context without any remote-side effect";
+    }
+
+    TEST(RdmaTransportContractTest, PullDisconnectAfterReadPostedAwaitsT005T009T010)
+    {
+        GTEST_SKIP() << "requires T005 transport plus T009/T010: an in-flight READ must be drained or "
+                        "reconciled safely, with no use-after-free and no duplicate completion callback";
+    }
+
+    TEST(RdmaTransportContractTest, PullDisconnectAfterReadCompletionAwaitsT010)
+    {
+        GTEST_SKIP() << "requires T010 StorageRdmaService: when the connection drops after READ completion "
+                        "but before the durable boundary, the result must not be reported as durable success";
+    }
+
+    TEST(RdmaTransportContractTest, PullRealChecksumVerificationAwaitsT010)
+    {
+        GTEST_SKIP() << "requires T010 storage adapter with the real chunk checksum contract: mismatched "
+                        "bytes must never be published as a valid chunk or reported as durable success";
+    }
+
+    TEST(RdmaTransportContractTest, PullRealIdempotencyAgainstChunkStoreAwaitsT010)
+    {
+        GTEST_SKIP() << "requires T010 mapping to ChunkStore::WriteChunk(): duplicate identities must follow "
+                        "the existing idempotent-duplicate or conflict rules without redefining them";
+    }
+
+    TEST(RdmaTransportContractTest, PullRealDurableAckOrderingAwaitsT010)
+    {
+        GTEST_SKIP() << "requires T010 StorageRdmaService: durable success may be emitted only after "
+                        "ChunkStore::WriteChunk() reports durable success, never at RDMA READ completion";
+    }
+
     TEST(RdmaTransportContractTest, RdmaRpcControllerContract)
     {
         rdma::RdmaRpcController controller;
