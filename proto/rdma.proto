@@ -43,7 +43,59 @@ message PullResponse {
   string error_detail = 5;
 }
 
+enum RdmaSlotState {
+  RDMA_SLOT_STATE_UNSPECIFIED = 0;
+  RDMA_SLOT_STATE_FREE = 1;
+  RDMA_SLOT_STATE_WRITING = 2;
+  RDMA_SLOT_STATE_READY = 3;
+  RDMA_SLOT_STATE_FLUSHING = 4;
+}
+
+message RdmaSlotDescriptor {
+  uint32 slot_id = 1;
+  uint64 remote_addr = 2;
+  uint32 rkey = 3;
+  uint64 capacity = 4;
+  uint64 slot_generation = 5;
+  RdmaSlotState state = 6;
+}
+
+message GetSlotPoolRequest {
+  string storage_node_id = 1;
+}
+
+message GetSlotPoolResponse {
+  bool ok = 1;
+  string error_detail = 2;
+  string storage_node_id = 3;
+  uint64 connection_generation = 4;
+  uint64 pool_generation = 5;
+  repeated RdmaSlotDescriptor slots = 6;
+}
+
+message PushReadyRequest {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  RdmaChunkChecksum checksum = 4;
+  uint32 slot_id = 5;
+  uint64 connection_generation = 6;
+  uint64 pool_generation = 7;
+  uint64 slot_generation = 8;
+}
+
+message PushReadyResponse {
+  bool ok = 1;
+  bool already_exists = 2;
+  bool durable = 3;
+  bool slot_reusable = 4;
+  string chunk_id = 5;
+  string error_detail = 6;
+}
+
 service RdmaControlService {
   rpc Probe(ProbeRequest) returns (ProbeResponse);
   rpc Pull(PullRequest) returns (PullResponse);
+  rpc GetSlotPool(GetSlotPoolRequest) returns (GetSlotPoolResponse);
+  rpc PushReady(PushReadyRequest) returns (PushReadyResponse);
 }

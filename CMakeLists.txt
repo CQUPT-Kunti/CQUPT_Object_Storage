@@ -333,6 +333,7 @@ if(CQUPT_RDMA)
     modules/rdma/rdma_memory_region.cpp
     modules/rdma/rdma_rpc_controller.cpp
     modules/rdma/rdma_server.cpp
+    modules/rdma/rdma_slot_pool.cpp
     modules/rdma/rdma_transport_linux.cpp
   )
 else()
@@ -341,6 +342,7 @@ else()
     modules/rdma/rdma_memory_region.cpp
     modules/rdma/rdma_rpc_controller.cpp
     modules/rdma/rdma_server.cpp
+    modules/rdma/rdma_slot_pool.cpp
     modules/rdma/rdma_transport.cpp
   )
 endif()

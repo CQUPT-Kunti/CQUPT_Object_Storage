@@ -41,6 +41,10 @@
 #include "rdma/rdma_memory_region.h"
 #define CQUPT_RDMA_CONTRACT_HAS_MEMORY_REGION 1
 #endif
+#if __has_include("rdma/rdma_slot_pool.h")
+#include "rdma/rdma_slot_pool.h"
+#define CQUPT_RDMA_CONTRACT_HAS_SLOT_POOL 1
+#endif
 #if __has_include("store/node/storage_rdma_service.h")
 #include "store/node/storage_rdma_service.h"
 #include "store/runtime/storage_executor.h"
@@ -408,7 +412,7 @@ namespace
 
         ASSERT_NE(descriptor, nullptr);
         EXPECT_EQ(descriptor->name(), "RdmaControlService");
-        EXPECT_EQ(descriptor->method_count(), 2);
+        EXPECT_EQ(descriptor->method_count(), 4);
         EXPECT_EQ(descriptor->method(0)->name(), "Probe");
         EXPECT_EQ(descriptor->method(0)->input_type()->name(), "ProbeRequest");
         EXPECT_EQ(descriptor->method(0)->output_type()->name(), "ProbeResponse");
@@ -417,7 +421,168 @@ namespace
         ASSERT_NE(pull, nullptr);
         EXPECT_EQ(pull->input_type()->name(), "PullRequest");
         EXPECT_EQ(pull->output_type()->name(), "PullResponse");
+
+        const google::protobuf::MethodDescriptor* get_slot_pool = descriptor->FindMethodByName("GetSlotPool");
+        ASSERT_NE(get_slot_pool, nullptr);
+        EXPECT_EQ(get_slot_pool->input_type()->name(), "GetSlotPoolRequest");
+        EXPECT_EQ(get_slot_pool->output_type()->name(), "GetSlotPoolResponse");
+
+        const google::protobuf::MethodDescriptor* push_ready = descriptor->FindMethodByName("PushReady");
+        ASSERT_NE(push_ready, nullptr);
+        EXPECT_EQ(push_ready->input_type()->name(), "PushReadyRequest");
+        EXPECT_EQ(push_ready->output_type()->name(), "PushReadyResponse");
         EXPECT_EQ(descriptor->FindMethodByName("Missing"), nullptr);
+    }
+
+    TEST(RdmaTransportContractTest, GetSlotPoolResponseRoundTripsSlotDescriptors)
+    {
+        raft::rdma::GetSlotPoolResponse response;
+        response.set_ok(true);
+        response.set_storage_node_id("storage-node-1");
+        response.set_connection_generation(5);
+        response.set_pool_generation(9);
+
+        raft::rdma::RdmaSlotDescriptor* first = response.add_slots();
+        first->set_slot_id(0);
+        first->set_remote_addr(0x00007F0012345000ULL);
+        first->set_rkey(0x00ABCDEFu);
+        first->set_capacity(4ULL * 1024ULL * 1024ULL);
+        first->set_slot_generation(9);
+        first->set_state(raft::rdma::RDMA_SLOT_STATE_FREE);
+
+        raft::rdma::RdmaSlotDescriptor* second = response.add_slots();
+        second->set_slot_id(1);
+        second->set_remote_addr(0x00007F0012349000ULL);
+        second->set_rkey(0x00ABCDE0u);
+        second->set_capacity(4ULL * 1024ULL * 1024ULL);
+        second->set_slot_generation(9);
+        second->set_state(raft::rdma::RDMA_SLOT_STATE_WRITING);
+
+        std::string bytes;
+        ASSERT_TRUE(response.SerializeToString(&bytes));
+        EXPECT_LT(bytes.size(), 512u);
+
+        raft::rdma::GetSlotPoolResponse parsed;
+        ASSERT_TRUE(parsed.ParseFromString(bytes));
+        EXPECT_TRUE(parsed.ok());
+        EXPECT_EQ(parsed.storage_node_id(), "storage-node-1");
+        EXPECT_EQ(parsed.connection_generation(), 5u);
+        EXPECT_EQ(parsed.pool_generation(), 9u);
+        ASSERT_EQ(parsed.slots_size(), 2);
+        EXPECT_EQ(parsed.slots(0).slot_id(), 0u);
+        EXPECT_EQ(parsed.slots(0).remote_addr(), 0x00007F0012345000ULL);
+        EXPECT_EQ(parsed.slots(0).rkey(), 0x00ABCDEFu);
+        EXPECT_EQ(parsed.slots(0).capacity(), 4ULL * 1024ULL * 1024ULL);
+        EXPECT_EQ(parsed.slots(0).slot_generation(), 9u);
+        EXPECT_EQ(parsed.slots(0).state(), raft::rdma::RDMA_SLOT_STATE_FREE);
+        EXPECT_EQ(parsed.slots(1).slot_id(), 1u);
+        EXPECT_EQ(parsed.slots(1).state(), raft::rdma::RDMA_SLOT_STATE_WRITING);
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyRequestCarriesSlotAndGenerationWithoutPayload)
+    {
+        raft::rdma::PushReadyRequest request;
+        request.set_chunk_id("object-1~7~0");
+        request.set_offset(0);
+        request.set_length(64ULL * 1024ULL * 1024ULL);
+        request.mutable_checksum()->set_algorithm(raft::rdma::RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256);
+        request.mutable_checksum()->set_value(std::string(64, 'b'));
+        request.mutable_checksum()->set_size_bytes(64ULL * 1024ULL * 1024ULL);
+        request.set_slot_id(3);
+        request.set_connection_generation(11);
+        request.set_pool_generation(12);
+        request.set_slot_generation(12);
+
+        std::string bytes;
+        ASSERT_TRUE(request.SerializeToString(&bytes));
+        EXPECT_LT(bytes.size(), 512u);
+
+        raft::rdma::PushReadyRequest parsed;
+        ASSERT_TRUE(parsed.ParseFromString(bytes));
+        EXPECT_EQ(parsed.chunk_id(), "object-1~7~0");
+        EXPECT_EQ(parsed.length(), 64ULL * 1024ULL * 1024ULL);
+        EXPECT_EQ(parsed.slot_id(), 3u);
+        EXPECT_EQ(parsed.connection_generation(), 11u);
+        EXPECT_EQ(parsed.pool_generation(), 12u);
+        EXPECT_EQ(parsed.slot_generation(), 12u);
+        EXPECT_EQ(parsed.checksum().algorithm(), raft::rdma::RDMA_CHUNK_CHECKSUM_ALGORITHM_SHA256);
+    }
+
+    TEST(RdmaTransportContractTest, PushReadyResponseExpressesDurableAndSlotReuse)
+    {
+        raft::rdma::PushReadyResponse success;
+        success.set_ok(true);
+        success.set_durable(true);
+        success.set_slot_reusable(true);
+        success.set_chunk_id("chunk-a");
+
+        std::string success_bytes;
+        ASSERT_TRUE(success.SerializeToString(&success_bytes));
+
+        raft::rdma::PushReadyResponse parsed_success;
+        ASSERT_TRUE(parsed_success.ParseFromString(success_bytes));
+        EXPECT_TRUE(parsed_success.ok());
+        EXPECT_TRUE(parsed_success.durable());
+        EXPECT_TRUE(parsed_success.slot_reusable());
+        EXPECT_FALSE(parsed_success.already_exists());
+
+        raft::rdma::PushReadyResponse failure;
+        failure.set_ok(false);
+        failure.set_durable(false);
+        failure.set_slot_reusable(false);
+        failure.set_error_detail("store failure");
+
+        std::string failure_bytes;
+        ASSERT_TRUE(failure.SerializeToString(&failure_bytes));
+
+        raft::rdma::PushReadyResponse parsed_failure;
+        ASSERT_TRUE(parsed_failure.ParseFromString(failure_bytes));
+        EXPECT_FALSE(parsed_failure.ok());
+        EXPECT_FALSE(parsed_failure.durable());
+        EXPECT_FALSE(parsed_failure.slot_reusable());
+        EXPECT_EQ(parsed_failure.error_detail(), "store failure");
+    }
+
+    TEST(RdmaTransportContractTest, GeneratedStubDispatchesGetSlotPoolThroughRpcChannel)
+    {
+        FakeRpcChannel channel;
+        raft::rdma::RdmaControlService::Stub stub(&channel);
+        TestRpcController controller;
+        raft::rdma::GetSlotPoolRequest request;
+        request.set_storage_node_id("storage-node-1");
+        raft::rdma::GetSlotPoolResponse response;
+        CountingClosure done;
+
+        stub.GetSlotPool(&controller, &request, &response, &done);
+
+        ASSERT_NE(channel.method(), nullptr);
+        EXPECT_EQ(channel.method()->full_name(), "raft.rdma.RdmaControlService.GetSlotPool");
+        EXPECT_EQ(channel.call_count(), 1);
+        EXPECT_EQ(done.runs.load(), 0);
+    }
+
+    TEST(RdmaTransportContractTest, GeneratedStubDispatchesPushReadyThroughRpcChannel)
+    {
+        FakeRpcChannel channel;
+        raft::rdma::RdmaControlService::Stub stub(&channel);
+        TestRpcController controller;
+        raft::rdma::PushReadyRequest request;
+        request.set_chunk_id("chunk-ready");
+        request.set_slot_id(1);
+        raft::rdma::PushReadyResponse response;
+        CountingClosure done;
+
+        stub.PushReady(&controller, &request, &response, &done);
+
+        ASSERT_NE(channel.method(), nullptr);
+        EXPECT_EQ(channel.method()->full_name(), "raft.rdma.RdmaControlService.PushReady");
+        EXPECT_EQ(channel.call_count(), 1);
+        EXPECT_EQ(done.runs.load(), 0);
+
+        const auto* captured = dynamic_cast<const raft::rdma::PushReadyRequest*>(channel.request());
+        ASSERT_NE(captured, nullptr);
+        EXPECT_EQ(captured->chunk_id(), "chunk-ready");
+        EXPECT_EQ(captured->slot_id(), 1u);
     }
 
     class PullRecordingService final : public raft::rdma::RdmaControlService
@@ -1635,6 +1800,385 @@ namespace
     }
 
 #endif
+
+#endif
+
+#if defined(CQUPT_RDMA_CONTRACT_HAS_SLOT_POOL)
+
+    class FakeSlotMemoryProvider final : public rdma::SlotMemoryProvider
+    {
+    public:
+        std::unique_ptr<rdma::RdmaMemoryRegion> AllocateSlotRegion(std::size_t size,
+                                                                   std::string* error) override
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++calls_;
+            if (fail_after_ >= 0 && static_cast<int>(calls_) > fail_after_)
+            {
+                if (error != nullptr)
+                {
+                    *error = "simulated slot region failure";
+                }
+                return nullptr;
+            }
+            return rdma::RdmaMemoryRegion::Allocate(size, error);
+        }
+
+        void FailAfter(int successful_allocations)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            fail_after_ = successful_allocations;
+        }
+
+        int calls() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return calls_;
+        }
+
+    private:
+        mutable std::mutex mutex_;
+        int calls_ = 0;
+        int fail_after_ = -1;
+    };
+
+    std::unique_ptr<rdma::ClientSlotPool> MakeSlotPool(FakeSlotMemoryProvider& provider,
+                                                       std::size_t slot_count,
+                                                       std::size_t slot_capacity,
+                                                       std::uint64_t connection_generation,
+                                                       std::uint64_t pool_generation,
+                                                       const std::string& storage_node_id,
+                                                       std::string* error)
+    {
+        rdma::SlotPoolOptions options;
+        options.slot_count = slot_count;
+        options.slot_capacity = slot_capacity;
+        options.connection_generation = connection_generation;
+        options.pool_generation = pool_generation;
+        options.storage_node_id = storage_node_id;
+        return rdma::ClientSlotPool::Create(&provider, options, error);
+    }
+
+    rdma::RemoteSlotPool MakeRemotePool(const rdma::ClientSlotPool& pool)
+    {
+        rdma::RemoteSlotPool remote;
+        remote.storage_node_id = pool.storage_node_id();
+        remote.connection_generation = pool.connection_generation();
+        remote.pool_generation = pool.pool_generation();
+        remote.slots = pool.Snapshot();
+        return remote;
+    }
+
+    TEST(RdmaTransportContractTest, SlotPoolCreatesFixedSlotsWithOwnedRegions)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 3, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        EXPECT_TRUE(pool->valid());
+        EXPECT_EQ(pool->slot_count(), 3u);
+        EXPECT_EQ(pool->slot_capacity(), 4096u);
+        EXPECT_EQ(pool->connection_generation(), 1u);
+        EXPECT_EQ(pool->pool_generation(), 1u);
+        EXPECT_EQ(pool->storage_node_id(), "storage-node-1");
+        EXPECT_EQ(provider.calls(), 3);
+
+        const std::vector<rdma::RemoteSlot> slots = pool->Snapshot();
+        ASSERT_EQ(slots.size(), 3u);
+        for (std::size_t index = 0; index < slots.size(); ++index)
+        {
+            EXPECT_EQ(slots[index].slot_id, static_cast<std::uint32_t>(index));
+            EXPECT_NE(slots[index].remote_addr, 0u);
+            EXPECT_EQ(slots[index].capacity, 4096u);
+            EXPECT_EQ(slots[index].generation, 1u);
+            EXPECT_EQ(slots[index].state, rdma::SlotState::kFree);
+            EXPECT_NE(pool->slot_data(slots[index].slot_id), nullptr);
+        }
+    }
+
+    TEST(RdmaTransportContractTest, SlotPoolRequiresProviderAndValidOptions)
+    {
+        std::string error;
+        rdma::SlotPoolOptions options;
+        options.slot_count = 1;
+        options.slot_capacity = 4096;
+        options.connection_generation = 1;
+        options.pool_generation = 1;
+        options.storage_node_id = "storage-node-1";
+
+        EXPECT_EQ(rdma::ClientSlotPool::Create(nullptr, options, &error), nullptr);
+        EXPECT_FALSE(error.empty());
+
+        FakeSlotMemoryProvider provider;
+        rdma::SlotPoolOptions invalid = options;
+        invalid.slot_count = 0;
+        EXPECT_EQ(rdma::ClientSlotPool::Create(&provider, invalid, &error), nullptr);
+
+        invalid = options;
+        invalid.slot_capacity = 0;
+        EXPECT_EQ(rdma::ClientSlotPool::Create(&provider, invalid, &error), nullptr);
+
+        invalid = options;
+        invalid.pool_generation = 0;
+        EXPECT_EQ(rdma::ClientSlotPool::Create(&provider, invalid, &error), nullptr);
+
+        invalid = options;
+        invalid.storage_node_id.clear();
+        EXPECT_EQ(rdma::ClientSlotPool::Create(&provider, invalid, &error), nullptr);
+        EXPECT_EQ(provider.calls(), 0);
+    }
+
+    TEST(RdmaTransportContractTest, SlotPoolAllocationFailureCleansUpCreatedSlots)
+    {
+        FakeSlotMemoryProvider provider;
+        provider.FailAfter(1);
+
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 3, 4096, 1, 1, "storage-node-1", &error);
+
+        EXPECT_EQ(pool, nullptr);
+        EXPECT_EQ(error, "simulated slot region failure");
+        EXPECT_EQ(provider.calls(), 2);
+    }
+
+    TEST(RdmaTransportContractTest, SlotPoolStateMachineTransitions)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        ASSERT_TRUE(pool->MarkReady(0, 1, &error)) << error;
+        EXPECT_EQ(pool->Slot(0)->state, rdma::SlotState::kReady);
+
+        ASSERT_TRUE(pool->BeginFlushing(0, 1, &error)) << error;
+        EXPECT_EQ(pool->Slot(0)->state, rdma::SlotState::kFlushing);
+
+        ASSERT_TRUE(pool->ReleaseSlot(0, 1, &error)) << error;
+        EXPECT_EQ(pool->Slot(0)->state, rdma::SlotState::kFree);
+
+        ASSERT_TRUE(pool->MarkReady(1, 1, &error)) << error;
+        ASSERT_TRUE(pool->AbortReady(1, 1, &error)) << error;
+        EXPECT_EQ(pool->Slot(1)->state, rdma::SlotState::kFree);
+    }
+
+    TEST(RdmaTransportContractTest, SlotPoolRejectsIllegalTransitionsAndStaleGeneration)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 5, 9, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        EXPECT_FALSE(pool->BeginFlushing(0, 9, &error));
+        EXPECT_FALSE(error.empty());
+
+        EXPECT_FALSE(pool->MarkReady(0, 8, &error));
+        EXPECT_FALSE(error.empty());
+
+        EXPECT_FALSE(pool->MarkReady(7, 9, &error));
+        EXPECT_FALSE(error.empty());
+
+        EXPECT_FALSE(pool->ReleaseSlot(0, 9, &error));
+        EXPECT_FALSE(error.empty());
+
+        ASSERT_TRUE(pool->MarkReady(0, 9, &error)) << error;
+        EXPECT_FALSE(pool->MarkReady(0, 9, &error));
+        EXPECT_FALSE(pool->AbortReady(1, 9, &error));
+        EXPECT_EQ(pool->Slot(0)->state, rdma::SlotState::kReady);
+    }
+
+    TEST(RdmaTransportContractTest, SlotPoolInvalidateRejectsFurtherUse)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        pool->Invalidate();
+
+        EXPECT_FALSE(pool->valid());
+        EXPECT_TRUE(pool->Snapshot().empty());
+        EXPECT_FALSE(pool->Slot(0).has_value());
+        EXPECT_EQ(pool->slot_data(0), nullptr);
+        EXPECT_FALSE(pool->MarkReady(0, 1, &error));
+        EXPECT_FALSE(error.empty());
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapSelectsCapacitySufficientFreeSlotAndMarksWriting)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 3, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+        EXPECT_EQ(map.free_slot_count("storage-node-1"), 3u);
+
+        const std::optional<rdma::RemoteSlot> first = map.SelectFreeSlot("storage-node-1", 1024, &error);
+        ASSERT_TRUE(first.has_value()) << error;
+        EXPECT_EQ(first->slot_id, 0u);
+        EXPECT_EQ(first->state, rdma::SlotState::kWriting);
+        EXPECT_EQ(map.Slot("storage-node-1", 0)->state, rdma::SlotState::kWriting);
+        EXPECT_EQ(map.free_slot_count("storage-node-1"), 2u);
+
+        const std::optional<rdma::RemoteSlot> second = map.SelectFreeSlot("storage-node-1", 4096, &error);
+        ASSERT_TRUE(second.has_value()) << error;
+        EXPECT_EQ(second->slot_id, 1u);
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapConcurrentSelectionHasNoDuplicates)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 8, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        std::mutex selected_mutex;
+        std::vector<std::uint32_t> selected;
+        std::vector<std::thread> threads;
+        for (int index = 0; index < 8; ++index)
+        {
+            threads.emplace_back([&map, &selected_mutex, &selected]
+                                 {
+                                     std::string select_error;
+                                     const std::optional<rdma::RemoteSlot> slot =
+                                         map.SelectFreeSlot("storage-node-1", 1, &select_error);
+                                     if (slot.has_value())
+                                     {
+                                         std::lock_guard<std::mutex> lock(selected_mutex);
+                                         selected.push_back(slot->slot_id);
+                                     }
+                                 });
+        }
+        for (std::thread& thread : threads)
+        {
+            thread.join();
+        }
+
+        ASSERT_EQ(selected.size(), 8u);
+        std::sort(selected.begin(), selected.end());
+        EXPECT_EQ(std::adjacent_find(selected.begin(), selected.end()), selected.end());
+        EXPECT_EQ(map.free_slot_count("storage-node-1"), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapStoresPoolsPerStorageNodeWithIsolation)
+    {
+        FakeSlotMemoryProvider provider_a;
+        FakeSlotMemoryProvider provider_b;
+        std::string error;
+
+        std::unique_ptr<rdma::ClientSlotPool> pool_a =
+            MakeSlotPool(provider_a, 2, 4096, 1, 1, "storage-node-a", &error);
+        ASSERT_NE(pool_a, nullptr) << error;
+        std::unique_ptr<rdma::ClientSlotPool> pool_b =
+            MakeSlotPool(provider_b, 2, 4096, 1, 1, "storage-node-b", &error);
+        ASSERT_NE(pool_b, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool_a), &error)) << error;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool_b), &error)) << error;
+
+        const std::optional<rdma::RemoteSlot> selected_a = map.SelectFreeSlot("storage-node-a", 1, &error);
+        ASSERT_TRUE(selected_a.has_value()) << error;
+        EXPECT_EQ(map.free_slot_count("storage-node-a"), 1u);
+        EXPECT_EQ(map.free_slot_count("storage-node-b"), 2u);
+        EXPECT_EQ(map.Slot("storage-node-b", selected_a->slot_id)->state, rdma::SlotState::kFree);
+
+        EXPECT_NE(map.Slot("storage-node-a", 0)->remote_addr, map.Slot("storage-node-b", 0)->remote_addr);
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapRejectsInsufficientCapacityAndExhaustion)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 100, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        EXPECT_FALSE(map.SelectFreeSlot("storage-node-1", 101, &error).has_value());
+        EXPECT_NE(error.find("sufficient capacity"), std::string::npos);
+
+        ASSERT_TRUE(map.SelectFreeSlot("storage-node-1", 100, &error).has_value()) << error;
+        ASSERT_TRUE(map.SelectFreeSlot("storage-node-1", 100, &error).has_value()) << error;
+
+        EXPECT_FALSE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value());
+        EXPECT_NE(error.find("no free slot available"), std::string::npos);
+        EXPECT_EQ(map.free_slot_count("storage-node-1"), 0u);
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapRejectsStaleConnectionAndPoolGenerations)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 5, 7, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        EXPECT_TRUE(map.ValidateGenerations("storage-node-1", 5, 7, &error));
+
+        EXPECT_FALSE(map.ValidateGenerations("storage-node-1", 4, 7, &error));
+        EXPECT_NE(error.find("connection generation"), std::string::npos);
+
+        EXPECT_FALSE(map.ValidateGenerations("storage-node-1", 5, 6, &error));
+        EXPECT_NE(error.find("pool generation"), std::string::npos);
+
+        EXPECT_FALSE(map.ValidateGenerations("storage-node-missing", 5, 7, &error));
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapRejectsPoolWithMismatchedSlotGeneration)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 4, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotPool remote = MakeRemotePool(*pool);
+        remote.slots[0].generation = 3;
+
+        rdma::RemoteSlotMap map;
+        EXPECT_FALSE(map.StorePool(std::move(remote), &error));
+        EXPECT_FALSE(error.empty());
+        EXPECT_FALSE(map.HasPool("storage-node-1"));
+    }
+
+    TEST(RdmaTransportContractTest, RemoteSlotMapInvalidationDropsStoredSlots)
+    {
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+        ASSERT_TRUE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value()) << error;
+
+        map.InvalidatePool("storage-node-1");
+
+        EXPECT_FALSE(map.HasPool("storage-node-1"));
+        EXPECT_FALSE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value());
+        EXPECT_FALSE(map.Slot("storage-node-1", 0).has_value());
+        EXPECT_EQ(map.free_slot_count("storage-node-1"), 0u);
+    }
 
 #endif
 
@@ -3882,76 +4426,279 @@ namespace
         GTEST_SKIP() << "requires T013: a failed WRITE completion must not post or cause a successful READY";
     }
 
-    TEST(RdmaTransportContractTest, PushReadyCarriesSlotChunkAndGenerationAwaitsT012T013)
+    TEST(RdmaTransportContractTest, PushReadyMessageCarriesSlotChunkAndGeneration)
     {
-        GTEST_SKIP() << "requires T012 READY control messages and T013: READY must identify the slot, chunk "
-                        "identity, pool/slot generation, and length for the completed WRITE";
+        raft::rdma::PushReadyRequest request;
+        request.set_chunk_id("object-1~7~0");
+        request.set_length(4096);
+        request.set_slot_id(1);
+        request.set_connection_generation(3);
+        request.set_pool_generation(4);
+        request.set_slot_generation(4);
+
+        std::string bytes;
+        ASSERT_TRUE(request.SerializeToString(&bytes));
+        EXPECT_LT(bytes.size(), 512u);
+
+        raft::rdma::PushReadyRequest parsed;
+        ASSERT_TRUE(parsed.ParseFromString(bytes));
+        EXPECT_EQ(parsed.chunk_id(), "object-1~7~0");
+        EXPECT_EQ(parsed.length(), 4096u);
+        EXPECT_EQ(parsed.slot_id(), 1u);
+        EXPECT_EQ(parsed.connection_generation(), 3u);
+        EXPECT_EQ(parsed.pool_generation(), 4u);
+        EXPECT_EQ(parsed.slot_generation(), 4u);
     }
 
-    TEST(RdmaTransportContractTest, PushClientSlotPoolsAreConnectionScopedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushClientSlotPoolsAreConnectionScopedForTwoClients)
     {
-        GTEST_SKIP() << "requires T012 SlotPool: each Client connection receives descriptors for its own pool only";
+        FakeSlotMemoryProvider provider_a;
+        FakeSlotMemoryProvider provider_b;
+        std::string error;
+
+        std::unique_ptr<rdma::ClientSlotPool> pool_a =
+            MakeSlotPool(provider_a, 2, 4096, 1, 1, "storage-node-a", &error);
+        ASSERT_NE(pool_a, nullptr) << error;
+        std::unique_ptr<rdma::ClientSlotPool> pool_b =
+            MakeSlotPool(provider_b, 2, 4096, 2, 2, "storage-node-b", &error);
+        ASSERT_NE(pool_b, nullptr) << error;
+
+        EXPECT_NE(pool_a->storage_node_id(), pool_b->storage_node_id());
+        EXPECT_NE(pool_a->connection_generation(), pool_b->connection_generation());
+
+        const std::vector<rdma::RemoteSlot> slots_a = pool_a->Snapshot();
+        const std::vector<rdma::RemoteSlot> slots_b = pool_b->Snapshot();
+        ASSERT_EQ(slots_a.size(), 2u);
+        ASSERT_EQ(slots_b.size(), 2u);
+        EXPECT_EQ(slots_a[0].slot_id, slots_b[0].slot_id);
+        EXPECT_NE(slots_a[0].remote_addr, slots_b[0].remote_addr);
+
+        ASSERT_TRUE(pool_a->MarkReady(0, 1, &error)) << error;
+        EXPECT_EQ(pool_b->Slot(0)->state, rdma::SlotState::kFree);
     }
 
     TEST(RdmaTransportContractTest, PushSameSlotIdAcrossPoolsIsNotInterchangeableAwaitsT012T013)
     {
         GTEST_SKIP() << "requires T012/T013: identical slot_id values in two client pools must never be "
-                        "interchangeable across connections";
+                        "interchangeable across connections; server-side READY validation belongs to T013";
     }
 
-    TEST(RdmaTransportContractTest, PushPoolExhaustionDoesNotAffectOtherClientAwaitsT012)
+    TEST(RdmaTransportContractTest, PushPoolExhaustionDoesNotAffectOtherClient)
     {
-        GTEST_SKIP() << "requires T012: exhausting Client A’s pool must not change any Client B slot state";
+        FakeSlotMemoryProvider provider_a;
+        FakeSlotMemoryProvider provider_b;
+        std::string error;
+
+        std::unique_ptr<rdma::ClientSlotPool> pool_a =
+            MakeSlotPool(provider_a, 2, 4096, 1, 1, "storage-node-a", &error);
+        ASSERT_NE(pool_a, nullptr) << error;
+        std::unique_ptr<rdma::ClientSlotPool> pool_b =
+            MakeSlotPool(provider_b, 2, 4096, 1, 1, "storage-node-b", &error);
+        ASSERT_NE(pool_b, nullptr) << error;
+
+        rdma::RemoteSlotMap map_a;
+        ASSERT_TRUE(map_a.StorePool(MakeRemotePool(*pool_a), &error)) << error;
+        ASSERT_TRUE(map_a.SelectFreeSlot("storage-node-a", 1, &error).has_value()) << error;
+        ASSERT_TRUE(map_a.SelectFreeSlot("storage-node-a", 1, &error).has_value()) << error;
+        EXPECT_EQ(map_a.free_slot_count("storage-node-a"), 0u);
+        EXPECT_FALSE(map_a.SelectFreeSlot("storage-node-a", 1, &error).has_value());
+
+        EXPECT_EQ(pool_b->Slot(0)->state, rdma::SlotState::kFree);
+        EXPECT_EQ(pool_b->Slot(1)->state, rdma::SlotState::kFree);
     }
 
-    TEST(RdmaTransportContractTest, PushClientMirrorNeverOverridesStoreAuthorityAwaitsT012T019)
+    TEST(RdmaTransportContractTest, PushClientMirrorCannotInventSlots)
     {
-        GTEST_SKIP() << "requires T012 and T019: the client-side slot mirror must not replace store-side "
-                        "ownership and generation validation";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        EXPECT_FALSE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value());
+        EXPECT_FALSE(map.HasPool("storage-node-1"));
+
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+        EXPECT_FALSE(map.SelectFreeSlot("other-storage-node", 1, &error).has_value());
+        EXPECT_FALSE(map.ValidateGenerations("storage-node-1", 2, 1, &error));
+        EXPECT_TRUE(map.ValidateGenerations("storage-node-1", 1, 1, &error));
+
+        ASSERT_TRUE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value()) << error;
+        EXPECT_FALSE(map.MarkReady("storage-node-1", 99, 1, &error));
+        EXPECT_FALSE(error.empty());
     }
 
-    TEST(RdmaTransportContractTest, PushSlotStateMachineFollowsFreeWritingReadyFlushingFreeAwaitsT012)
+    TEST(RdmaTransportContractTest, PushSlotStateMachineFollowsFreeWritingReadyFlushingFree)
     {
-        GTEST_SKIP() << "requires T012 SlotPool: slots must follow FREE -> WRITING -> READY -> FLUSHING -> FREE";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        const std::optional<rdma::RemoteSlot> selected = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(selected.has_value()) << error;
+        EXPECT_EQ(selected->state, rdma::SlotState::kWriting);
+
+        ASSERT_TRUE(map.MarkReady("storage-node-1", selected->slot_id, 1, &error)) << error;
+        EXPECT_EQ(map.Slot("storage-node-1", selected->slot_id)->state, rdma::SlotState::kReady);
+
+        ASSERT_TRUE(map.MarkFlushing("storage-node-1", selected->slot_id, 1, &error)) << error;
+        EXPECT_EQ(map.Slot("storage-node-1", selected->slot_id)->state, rdma::SlotState::kFlushing);
+
+        ASSERT_TRUE(map.ReleaseSlot("storage-node-1", selected->slot_id, 1, &error)) << error;
+        EXPECT_EQ(map.Slot("storage-node-1", selected->slot_id)->state, rdma::SlotState::kFree);
     }
 
-    TEST(RdmaTransportContractTest, PushIllegalSlotTransitionsAreRejectedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushIllegalSlotTransitionsAreRejected)
     {
-        GTEST_SKIP() << "requires T012: WRITING -> FREE before safe completion, FLUSHING -> WRITING, and "
-                        "READY -> WRITING must all be rejected";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        const std::optional<rdma::RemoteSlot> selected = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(selected.has_value()) << error;
+
+        EXPECT_FALSE(map.MarkFlushing("storage-node-1", selected->slot_id, 1, &error));
+        EXPECT_FALSE(map.ReleaseSlot("storage-node-1", selected->slot_id, 1, &error));
+        EXPECT_FALSE(map.MarkReady("storage-node-1", selected->slot_id, 2, &error));
+
+        ASSERT_TRUE(map.MarkReady("storage-node-1", selected->slot_id, 1, &error)) << error;
+        EXPECT_FALSE(map.MarkReady("storage-node-1", selected->slot_id, 1, &error));
+        EXPECT_FALSE(map.AbortWriting("storage-node-1", selected->slot_id, 1, &error));
+        EXPECT_FALSE(map.MarkFlushing("storage-node-1", selected->slot_id, 2, &error));
+        EXPECT_EQ(map.Slot("storage-node-1", selected->slot_id)->state, rdma::SlotState::kReady);
     }
 
-    TEST(RdmaTransportContractTest, PushBusySlotCannotBeReallocatedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushBusySlotCannotBeReallocated)
     {
-        GTEST_SKIP() << "requires T012: a slot in WRITING/READY/FLUSHING must not be selected again";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        const std::optional<rdma::RemoteSlot> first = map.SelectFreeSlot("storage-node-1", 1, &error);
+        const std::optional<rdma::RemoteSlot> second = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(first.has_value()) << error;
+        ASSERT_TRUE(second.has_value()) << error;
+        EXPECT_NE(first->slot_id, second->slot_id);
+
+        EXPECT_FALSE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value());
+        EXPECT_NE(error.find("no free slot available"), std::string::npos);
+        EXPECT_EQ(map.free_slot_count("storage-node-1"), 0u);
     }
 
-    TEST(RdmaTransportContractTest, PushStaleConnectionGenerationIsRejectedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushStaleConnectionGenerationIsRejected)
     {
-        GTEST_SKIP() << "requires T012: a READY/descriptor bound to a stale connection generation must be rejected";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 7, 8, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        EXPECT_FALSE(map.ValidateGenerations("storage-node-1", 6, 8, &error));
+        EXPECT_NE(error.find("connection generation"), std::string::npos);
+        EXPECT_TRUE(map.ValidateGenerations("storage-node-1", 7, 8, &error));
     }
 
-    TEST(RdmaTransportContractTest, PushStalePoolGenerationIsRejectedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushStalePoolGenerationIsRejected)
     {
-        GTEST_SKIP() << "requires T012: a descriptor from an older pool generation must be rejected after "
-                        "a pool refresh/reconnect";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 7, 8, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+
+        EXPECT_FALSE(map.ValidateGenerations("storage-node-1", 7, 6, &error));
+        EXPECT_NE(error.find("pool generation"), std::string::npos);
     }
 
-    TEST(RdmaTransportContractTest, PushStaleSlotGenerationIsRejectedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushStaleSlotGenerationIsRejected)
     {
-        GTEST_SKIP() << "requires T012: a slot whose generation no longer matches the authoritative pool "
-                        "generation must be rejected";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 4, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+        const std::optional<rdma::RemoteSlot> selected = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(selected.has_value()) << error;
+
+        EXPECT_FALSE(map.MarkReady("storage-node-1", selected->slot_id, 3, &error));
+        EXPECT_NE(error.find("generation"), std::string::npos);
+        EXPECT_TRUE(map.MarkReady("storage-node-1", selected->slot_id, 4, &error));
     }
 
-    TEST(RdmaTransportContractTest, PushReconnectAndStoreRestartInvalidateOldDescriptorsAwaitsT012)
+    TEST(RdmaTransportContractTest, PushReconnectAndStoreRestartInvalidateOldDescriptors)
     {
-        GTEST_SKIP() << "requires T012: reconnect and store restart must invalidate old slot descriptors";
+        FakeSlotMemoryProvider first_provider;
+        FakeSlotMemoryProvider second_provider;
+        std::string error;
+
+        std::unique_ptr<rdma::ClientSlotPool> first_pool =
+            MakeSlotPool(first_provider, 2, 4096, 1, 1, "storage-node-1", &error);
+        ASSERT_NE(first_pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*first_pool), &error)) << error;
+        const std::optional<rdma::RemoteSlot> stale = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(stale.has_value()) << error;
+        const std::uint64_t stale_generation = stale->generation;
+        const std::uint32_t stale_slot_id = stale->slot_id;
+
+        map.InvalidatePool("storage-node-1");
+        EXPECT_FALSE(map.SelectFreeSlot("storage-node-1", 1, &error).has_value());
+
+        std::unique_ptr<rdma::ClientSlotPool> refreshed_pool =
+            MakeSlotPool(second_provider, 2, 4096, 2, 2, "storage-node-1", &error);
+        ASSERT_NE(refreshed_pool, nullptr) << error;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*refreshed_pool), &error)) << error;
+
+        const std::optional<rdma::RemoteSlot> refreshed = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(refreshed.has_value()) << error;
+
+        EXPECT_FALSE(map.MarkReady("storage-node-1", stale_slot_id, stale_generation, &error));
+        EXPECT_FALSE(map.MarkReady("storage-node-1", refreshed->slot_id, stale_generation, &error));
+        EXPECT_TRUE(map.MarkReady("storage-node-1", refreshed->slot_id, refreshed->generation, &error));
     }
 
-    TEST(RdmaTransportContractTest, PushSameSlotIdDifferentGenerationIsRejectedAwaitsT012)
+    TEST(RdmaTransportContractTest, PushSameSlotIdDifferentGenerationIsRejected)
     {
-        GTEST_SKIP() << "requires T012: the same slot_id with a different generation must not be treated as "
-                        "the same writable slot";
+        FakeSlotMemoryProvider provider;
+        std::string error;
+        std::unique_ptr<rdma::ClientSlotPool> pool =
+            MakeSlotPool(provider, 2, 4096, 1, 5, "storage-node-1", &error);
+        ASSERT_NE(pool, nullptr) << error;
+
+        rdma::RemoteSlotMap map;
+        ASSERT_TRUE(map.StorePool(MakeRemotePool(*pool), &error)) << error;
+        const std::optional<rdma::RemoteSlot> selected = map.SelectFreeSlot("storage-node-1", 1, &error);
+        ASSERT_TRUE(selected.has_value()) << error;
+
+        EXPECT_FALSE(map.MarkReady("storage-node-1", selected->slot_id, 4, &error));
+        EXPECT_NE(error.find("generation"), std::string::npos);
+        EXPECT_TRUE(map.MarkReady("storage-node-1", selected->slot_id, 5, &error));
     }
 
     TEST(RdmaTransportContractTest, PushReadyWithoutWriteIsRejectedAwaitsT013)
